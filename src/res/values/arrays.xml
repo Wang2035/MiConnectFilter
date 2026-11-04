@@ -1,0 +1,11 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <string-array name="xposed_scope">
+        <item>com.miui.connectionshare</item>
+        <item>com.milink.service</item>
+        <item>com.miui.bluetoothext</item>
+        <item>com.xiaomi.bluetooth</item>
+        <item>com.android.bluetooth</item>
+        <item>com.xiaomi.mi_connect_service</item>
+    </string-array>
+</resources>

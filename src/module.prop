@@ -1,0 +1,5 @@
+name=MiConnectFilter
+author=miconnect
+description=HyperOS 3 fast-connect popup filter: earbud MAC whitelist across connectionshare, MiLink, Bluetooth extension/stack processes; paired devices always allowed; 5-min temporary bypass
+minApiVersion=101
+targetApiVersion=102

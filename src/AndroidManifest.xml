@@ -1,0 +1,59 @@
+<?xml version="1.0" encoding="utf-8"?>
+<manifest xmlns:android="http://schemas.android.com/apk/res/android"
+    package="com.miconnect.filter"
+    android:versionCode="17"
+    android:versionName="1.16">
+
+    <uses-sdk
+        android:minSdkVersion="27"
+        android:targetSdkVersion="36" />
+
+    <uses-permission android:name="android.permission.BLUETOOTH" android:maxSdkVersion="30" />
+    <uses-permission android:name="android.permission.BLUETOOTH_CONNECT" />
+    <uses-permission android:name="android.permission.QUERY_ALL_PACKAGES" />
+    <uses-permission android:name="android.permission.RECEIVE_BOOT_COMPLETED" />
+
+    <application
+        android:label="妙享快连过滤"
+        android:icon="@mipmap/ic_launcher"
+        android:theme="@android:style/Theme.Material.NoActionBar">
+        <activity
+            android:name=".MainActivity"
+            android:exported="true">
+            <intent-filter>
+                <action android:name="android.intent.action.MAIN" />
+                <category android:name="android.intent.category.LAUNCHER" />
+            </intent-filter>
+        </activity>
+        <activity
+            android:name=".PairedActivity"
+            android:exported="false" />
+        <receiver
+            android:name=".ConfigRequestReceiver"
+            android:exported="true">
+            <intent-filter>
+                <action android:name="com.miconnect.filter.action.CONFIG_REQUEST" />
+            </intent-filter>
+        </receiver>
+        <receiver
+            android:name=".BootResyncReceiver"
+            android:exported="true">
+            <intent-filter>
+                <action android:name="android.intent.action.BOOT_COMPLETED" />
+            </intent-filter>
+        </receiver>
+
+        <meta-data
+            android:name="xposedmodule"
+            android:value="true" />
+        <meta-data
+            android:name="xposeddescription"
+            android:value="HyperOS MiConnect (com.miui.connectionshare) fast-connect popup filter: MAC whitelist for Xiaomi earbuds, paired devices always allowed, 5-min temporary bypass for adding new devices" />
+        <meta-data
+            android:name="xposedminversion"
+            android:value="101" />
+        <meta-data
+            android:name="xposedscope"
+            android:resource="@array/xposed_scope" />
+    </application>
+</manifest>
