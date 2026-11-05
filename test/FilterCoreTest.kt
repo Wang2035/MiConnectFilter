@@ -126,6 +126,34 @@ fun main() {
         base.copy(whitelist = setOf(otherMac)), probe(mac = otherMac, bonded = true), now) == Decision.ALLOW)
     check("strict reason", FilterCore.decideWithReason(base, probe(bonded = true), now).second == "strict-bonded-not-whitelisted")
 
+    // --- paired list grouping (v1.17: same-device multi-address merge, like system settings) ---
+    val g1 = PairedGrouping.group(listOf(
+        PairedEntry("布洛芬缓释胶囊2粒/盒", "00:BB:43:1C:B8:9C"),
+        PairedEntry("布洛芬缓释胶囊2粒/盒", "00:BB:43:1C:F9:EC"),
+        PairedEntry("REDMI Buds 8 青春版", "A0:90:B5:DB:48:0D"),
+    ))
+    check("group same-name merges", g1.size == 2 && g1[0].size == 2)
+    check("group keeps macs", g1[0].map { it.mac } == listOf("00:BB:43:1C:B8:9C", "00:BB:43:1C:F9:EC"))
+    check("group other separate", g1[1].single().mac == "A0:90:B5:DB:48:0D")
+    val g2 = PairedGrouping.group(listOf(
+        PairedEntry("A", "11:11:11:11:11:11"),
+        PairedEntry("B", "22:22:22:22:22:22"),
+        PairedEntry("A", "33:33:33:33:33:33"),
+    ))
+    check("group non-adjacent merges, order kept", g2.size == 2 && g2[0].map { it.mac } ==
+        listOf("11:11:11:11:11:11", "33:33:33:33:33:33") && g2[1].single().name == "B")
+    val g3 = PairedGrouping.group(listOf(
+        PairedEntry(null, "44:44:44:44:44:44"),
+        PairedEntry("  ", "55:55:55:55:55:55"),
+        PairedEntry(null, "66:66:66:66:66:66"),
+    ))
+    check("group blank names never merge", g3.size == 3)
+    check("group empty", PairedGrouping.group(emptyList()).isEmpty())
+    check("wl status all", PairedGrouping.status(listOf("A", "B"), setOf("A", "B", "C")) == PairedGrouping.WlStatus.ALL)
+    check("wl status partial", PairedGrouping.status(listOf("A", "B"), setOf("A")) == PairedGrouping.WlStatus.PARTIAL)
+    check("wl status none", PairedGrouping.status(listOf("A", "B"), setOf("C")) == PairedGrouping.WlStatus.NONE)
+    check("wl status empty macs", PairedGrouping.status(emptyList(), setOf("A")) == PairedGrouping.WlStatus.NONE)
+
     println(if (failures == 0) "ALL TESTS PASSED" else "$failures FAILURES")
     if (failures > 0) kotlin.system.exitProcess(1)
 }

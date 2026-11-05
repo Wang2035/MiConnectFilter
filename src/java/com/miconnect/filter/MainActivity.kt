@@ -345,7 +345,8 @@ class MainActivity : Activity() {
                 list = updated
             }
         }
-        wlCount.text = "${list.size} 台"
+        val groups = PairedGrouping.group(list.map { PairedEntry(it.second, it.first) })
+        wlCount.text = "${groups.size} 台"
         wlBox.removeAllViews()
         if (list.isEmpty()) {
             wlBox.addView(txt("还没有添加", 14f, subC).apply {
@@ -353,23 +354,25 @@ class MainActivity : Activity() {
             })
             return
         }
-        for ((mac, label) in list) {
+        for (group in groups) {
+            val macs = group.map { it.mac }
+            val label = group.first().name ?: ""
             val item = LinearLayout(this).apply {
                 orientation = LinearLayout.VERTICAL
                 setPadding(0, dp(9), 0, dp(9))
                 addView(txt(if (label.isNotBlank()) label else "未命名", 16f, titleC))
-                addView(txt(mac, 12f, subC))
+                addView(txt(
+                    if (macs.size == 1) macs.single()
+                    else macs.joinToString(" · ") + "\n同一设备的 ${macs.size} 个地址",
+                    12f, subC))
                 setOnClickListener {
                     MiuixUi.showDialog(
                         this@MainActivity,
                         title = "删除这台耳机？",
-                        message = mac,
+                        message = macs.joinToString("\n"),
                         positiveText = "删除",
                         onPositive = {
-                            ConfSync.writeWhitelist(
-                                prefs,
-                                ConfSync.readWhitelist(prefs).filter { it.first != mac },
-                            )
+                            ConfSync.removeFromWhitelist(this@MainActivity, macs)
                             refreshWhitelist()
                             syncAsync(showError = true)
                         },

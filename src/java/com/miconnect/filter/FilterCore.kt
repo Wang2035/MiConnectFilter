@@ -120,6 +120,39 @@ object MacUtil {
     }
 }
 
+/** 已配对列表的一条记录（显示名 + 已归一化 MAC）。 */
+data class PairedEntry(val name: String?, val mac: String)
+
+/**
+ * 与系统蓝牙设置页对齐的合并：同一台物理设备可能有两条配对记录
+ * （经典蓝牙与 BLE 各配一次，地址不同），设置页按设备只显示一行，
+ * 这里按显示名合并成一组；点一次把组内全部 MAC 加进白名单，
+ * 弹窗事件报哪个地址都能命中。名字为空的记录无法判断同机，不合并。
+ */
+object PairedGrouping {
+    fun group(entries: List<PairedEntry>): List<List<PairedEntry>> {
+        val map = LinkedHashMap<String, MutableList<PairedEntry>>()
+        for (e in entries) {
+            val key = e.name?.trim()?.takeIf { it.isNotEmpty() } ?: e.mac
+            map.getOrPut(key) { mutableListOf() }.add(e)
+        }
+        return map.values.map { it.toList() }
+    }
+
+    enum class WlStatus { ALL, PARTIAL, NONE }
+
+    /** 一组地址相对白名单的加入状态，供列表把「已加入/未加入」一眼区分。 */
+    fun status(macs: List<String>, whitelist: Set<String>): WlStatus {
+        if (macs.isEmpty()) return WlStatus.NONE
+        val hit = macs.count { it in whitelist }
+        return when {
+            hit == 0 -> WlStatus.NONE
+            hit == macs.size -> WlStatus.ALL
+            else -> WlStatus.PARTIAL
+        }
+    }
+}
+
 /** hook 层从 Intent / Notification / 方法参数里提取出的设备画像。 */
 data class Probe(
     val mac: String? = null,

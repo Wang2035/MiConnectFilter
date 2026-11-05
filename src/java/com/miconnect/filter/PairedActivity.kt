@@ -110,31 +110,88 @@ class PairedActivity : Activity() {
             listBox.addView(hint("没有读到已配对设备（蓝牙没开，或没有配对记录）。"))
             return
         }
-        val sorted = devices.sortedBy { try { DeviceNames.displayName(it) ?: it.address } catch (_: Throwable) { "" } }
-        for (dev in sorted) {
+        val entries = devices.mapNotNull { dev ->
             val name = try { DeviceNames.displayName(dev) } catch (_: Throwable) { null }
-            val mac = MacUtil.normalize(try { dev.address } catch (_: Throwable) { null }) ?: continue
+            val mac = MacUtil.normalize(try { dev.address } catch (_: Throwable) { null }) ?: return@mapNotNull null
+            PairedEntry(name, mac)
+        }.sortedBy { it.name ?: it.mac }
+        val whitelist = try {
+            ConfSync.readWhitelist(ConfSync.prefs(this)).map { it.first }.toSet()
+        } catch (_: Throwable) { emptySet() }
+        val accentC = "#3482FF"
+        val greenC = if (dark) "#30D158" else "#34C759"
+        val orangeC = if (dark) "#FF9F0A" else "#FF9500"
+        for (group in PairedGrouping.group(entries)) {
+            val name = group.first().name
+            val macs = group.map { it.mac }
+            val status = PairedGrouping.status(macs, whitelist)
             val rowView = LinearLayout(this).apply {
-                orientation = LinearLayout.VERTICAL
+                orientation = LinearLayout.HORIZONTAL
+                gravity = Gravity.CENTER_VERTICAL
                 setPadding(0, dp(12), 0, dp(12))
+                val texts = LinearLayout(this@PairedActivity).apply {
+                    orientation = LinearLayout.VERTICAL
+                    layoutParams = LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.WRAP_CONTENT, 1f)
+                    addView(TextView(this@PairedActivity).apply {
+                        text = if (name.isNullOrBlank()) "未命名设备" else name
+                        textSize = 16f
+                        setTextColor(Color.parseColor(
+                            if (status == PairedGrouping.WlStatus.ALL) subC else titleC))
+                    })
+                    addView(TextView(this@PairedActivity).apply {
+                        text = if (macs.size == 1) macs.single()
+                            else macs.joinToString(" · ") + "\n同一设备的 ${macs.size} 个地址，点一次全部加入"
+                        textSize = 13f
+                        setTextColor(Color.parseColor(subC))
+                    })
+                }
+                addView(texts)
                 addView(TextView(this@PairedActivity).apply {
-                    text = if (name.isNullOrBlank()) "未命名设备" else name
-                    textSize = 16f
-                    setTextColor(Color.parseColor(titleC))
-                })
-                addView(TextView(this@PairedActivity).apply {
-                    text = mac
-                    textSize = 13f
-                    setTextColor(Color.parseColor(subC))
+                    text = when (status) {
+                        PairedGrouping.WlStatus.ALL -> "✓ 已加入"
+                        PairedGrouping.WlStatus.PARTIAL -> "差 ${macs.size - macs.count { it in whitelist }} 个"
+                        PairedGrouping.WlStatus.NONE -> "加入"
+                    }
+                    textSize = 14f
+                    setTextColor(Color.parseColor(when (status) {
+                        PairedGrouping.WlStatus.ALL -> greenC
+                        PairedGrouping.WlStatus.PARTIAL -> orangeC
+                        PairedGrouping.WlStatus.NONE -> accentC
+                    }))
+                    setPadding(dp(10), 0, 0, 0)
                 })
                 setOnClickListener {
-                    if (ConfSync.addToWhitelist(this@PairedActivity, mac, name ?: "")) {
+                    if (status == PairedGrouping.WlStatus.ALL) {
+                        MiuixUi.showDialog(
+                            this@PairedActivity,
+                            title = "从白名单移除？",
+                            message = (name ?: "") + "\n" + macs.joinToString(" · "),
+                            positiveText = "移除",
+                            onPositive = {
+                                if (ConfSync.removeFromWhitelist(this@PairedActivity, macs) > 0) {
+                                    Thread { ConfSync.sync(this@PairedActivity) }.start()
+                                    toast("已移除：${name ?: ""}")
+                                    loadDevices()
+                                }
+                            },
+                            negativeText = "取消",
+                        )
+                        return@setOnClickListener
+                    }
+                    var added = 0
+                    for (m in macs) {
+                        if (ConfSync.addToWhitelist(this@PairedActivity, m, name ?: "")) added++
+                    }
+                    if (added > 0) {
                         Thread { ConfSync.sync(this@PairedActivity) }.start()
-                        toast("已加入白名单：${name ?: mac}")
+                        toast(
+                            if (macs.size > 1) "已加入白名单：${name ?: ""}（补齐 ${macs.size} 个地址）"
+                            else "已加入白名单：${name ?: macs.single()}"
+                        )
+                        loadDevices()
                     } else {
                         toast("该设备已在白名单里")
                     }
-                    finish()
                 }
             }
             listBox.addView(rowView)

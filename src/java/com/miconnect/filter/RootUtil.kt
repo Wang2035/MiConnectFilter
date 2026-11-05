@@ -131,6 +131,18 @@ object ConfSync {
         return true
     }
 
+    /** 按 MAC 批量移除白名单条目，返回实际删除条数。 */
+    fun removeFromWhitelist(ctx: Context, macs: Collection<String>): Int {
+        val norm = macs.mapNotNull { MacUtil.normalize(it) }.toSet()
+        if (norm.isEmpty()) return 0
+        val p = prefs(ctx)
+        val list = readWhitelist(p)
+        val kept = list.filter { it.first !in norm }
+        if (kept.size == list.size) return 0
+        writeWhitelist(p, kept)
+        return list.size - kept.size
+    }
+
     /** 当前有效的临时放行截止时间；已过期自动归零。 */
     fun effectiveBypassUntil(p: SharedPreferences): Long {
         val until = p.getLong("bypass_until", 0L)
