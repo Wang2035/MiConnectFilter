@@ -1,4 +1,4 @@
-import com.miconnect.filter.*
+import io.github.wang2035.miconnectfilter.*
 
 var failures = 0
 fun check(name: String, cond: Boolean) {

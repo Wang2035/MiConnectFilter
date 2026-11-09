@@ -6,6 +6,8 @@
 
 LSPosed（Zygote）模块，过滤小米耳机「妙享快连」发现弹窗：只放行白名单里的耳机，其它小米耳机的弹窗一律拦截。在 KernelSU + LSPosed 环境下、澎湃 OS 3 / Android 16 实测可用。
 
+包名：`io.github.wang2035.miconnectfilter`（v1.20 起由 com.miconnect.filter 改名，以满足 LSPosed 仓库的包名归属要求；旧包名版本需卸载后重装，白名单需重新添加。）
+
 ### 功能
 
 - **严格执行白名单（默认且写死，无开关）**：弹窗场景下，只要是小米系耳机、不在白名单，不管配没配对都拦截；白名单内照常弹窗。
@@ -43,6 +45,8 @@ LSPosed（Zygote）模块，过滤小米耳机「妙享快连」发现弹窗：�
 ## English
 
 An LSPosed (Zygote) module that filters Xiaomi earbuds' "Mi Connect" fast-pair popups: only whitelisted earbuds may pop up; every other Xiaomi earbud's popup is blocked. Tested on HyperOS 3 / Android 16 with KernelSU + LSPosed.
+
+Package: `io.github.wang2035.miconnectfilter` (renamed from com.miconnect.filter in v1.20 to meet the LSPosed repository's package-ownership rules; uninstall the old package first, then re-add your whitelist.)
 
 ### Features
 
