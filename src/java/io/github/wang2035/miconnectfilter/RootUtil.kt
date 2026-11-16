@@ -186,12 +186,23 @@ object ConfSync {
      * 不依赖文件与 SELinux）。App 直发一遍，再用 root 的 am broadcast 发一遍
      * （特权发送方对系统进程更稳）。每次 sync 都发，暂停拦截点下去立刻到达。
      */
+    @Volatile private var lastBcSig: String? = null
+    @Volatile private var lastBcAt: Long = 0L
+
     fun sendConfigBroadcast(ctx: Context) {
         try {
             val v = currentValues(ctx)
             val wlCsv = v.whitelist.sorted().joinToString(",")
             val bgCsv = FilterConfig.renderBgMap(v.bgMap)
             val bgOptsCsv = BgOpt.renderMap(v.bgOpts)
+            // 去重：内容一字未变且 10 秒内刚广播过就跳过。每次 sync 都十二连发，
+            // 各目标进程被反复唤醒处理同一份配置（广播风暴），弹窗路径也跟着受累；
+            // 新起的进程有主动拉取 + 私有缓存兜底，不靠这波重复广播。
+            val sig = "${v.enabled}|$wlCsv|${v.bypassUntilMs}|${v.debug}|$bgCsv|$bgOptsCsv|${v.fontColor}"
+            val nowMs = System.currentTimeMillis()
+            if (sig == lastBcSig && nowMs - lastBcAt < 10_000L) return
+            lastBcSig = sig
+            lastBcAt = nowMs
             for (pkg in Targets.PACKAGES) {
                 val intent = Intent(ConfigBus.ACTION).apply {
                     setPackage(pkg)
@@ -314,7 +325,7 @@ object BgStore {
     fun savePoster(ctx: Context, key: String, bmp: android.graphics.Bitmap) {
         try {
             posterFile(ctx, key).outputStream().use {
-                bmp.compress(android.graphics.Bitmap.CompressFormat.JPEG, 82, it)
+                bmp.compress(android.graphics.Bitmap.CompressFormat.PNG, 100, it)
             }
         } catch (_: Throwable) {
         }
@@ -360,6 +371,17 @@ object BgStore {
     /** 保存图片字节并递增该 key 的版本号。返回新版本号。 */
     fun save(ctx: Context, key: String, bytes: ByteArray, mime: String): Long {
         fileFor(ctx, key).writeBytes(bytes)
+        try { posterFile(ctx, key).delete() } catch (_: Throwable) {}
+        val p = ConfSync.prefs(ctx)
+        val v = p.getLong("bg_ver_$key", 0L) + 1
+        p.edit().putString("bg_mime_$key", mime).putLong("bg_ver_$key", v)
+            .remove("bg_frames_$key").apply()
+        return v
+    }
+
+    /** 从文件存背景（大帧包流式落盘用，不经内存整包）；记账与 save 一致。 */
+    fun saveFile(ctx: Context, key: String, src: File, mime: String): Long {
+        src.copyTo(fileFor(ctx, key), overwrite = true)
         try { posterFile(ctx, key).delete() } catch (_: Throwable) {}
         val p = ConfSync.prefs(ctx)
         val v = p.getLong("bg_ver_$key", 0L) + 1

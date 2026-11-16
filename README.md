@@ -4,7 +4,7 @@
 
 ## 中文
 
-LSPosed（Zygote）模块，过滤小米耳机「妙享快连」发现弹窗：只放行白名单里的耳机，其它小米耳机的弹窗一律拦截。在 KernelSU + LSPosed 环境下、澎湃 OS 3 / Android 16 实测可用。
+LSPosed（Zygote）模块，过滤小米耳机「妙享快连」发现弹窗：只放行白名单里的耳机，其它小米耳机的弹窗一律拦截。在 KernelSU + LSPosed 环境下、澎湃 OS 3 / Android 16 实测可用；澎湃 OS 4 / Android 17 已适配（v1.34 起，待实测）。
 
 包名：`io.github.wang2035.miconnectfilter`（v1.20 起由 com.miconnect.filter 改名，以满足 LSPosed 仓库的包名归属要求；旧包名版本需卸载后重装，白名单需重新添加。）
 
@@ -20,7 +20,7 @@ LSPosed（Zygote）模块，过滤小米耳机「妙享快连」发现弹窗：�
 
 ### 环境要求
 
-- Android 16 / 澎湃 OS 3（其它版本未测）
+- Android 16 / 澎湃 OS 3（实测）；Android 17 / 澎湃 OS 4（已适配，待实测）。框架需支持 libxposed API 102 与 Android 17（如 LSPosed 2.x / Vector 2.1+）
 - KernelSU（或其它 Root 方案）+ LSPosed 2.x（libxposed API 101+）
 
 ### 使用
@@ -46,7 +46,7 @@ LSPosed（Zygote）模块，过滤小米耳机「妙享快连」发现弹窗：�
 
 ## English
 
-An LSPosed (Zygote) module that filters Xiaomi earbuds' "Mi Connect" fast-pair popups: only whitelisted earbuds may pop up; every other Xiaomi earbud's popup is blocked. Tested on HyperOS 3 / Android 16 with KernelSU + LSPosed.
+An LSPosed (Zygote) module that filters Xiaomi earbuds' "Mi Connect" fast-pair popups: only whitelisted earbuds may pop up; every other Xiaomi earbud's popup is blocked. Tested on HyperOS 3 / Android 16 with KernelSU + LSPosed; HyperOS 4 / Android 17 supported since v1.34 (pending on-device verification).
 
 Package: `io.github.wang2035.miconnectfilter` (renamed from com.miconnect.filter in v1.20 to meet the LSPosed repository's package-ownership rules; uninstall the old package first, then re-add your whitelist.)
 
@@ -62,7 +62,7 @@ Package: `io.github.wang2035.miconnectfilter` (renamed from com.miconnect.filter
 
 ### Requirements
 
-- Android 16 / HyperOS 3 (other versions untested)
+- Android 16 / HyperOS 3 (tested); Android 17 / HyperOS 4 (supported since v1.34, pending on-device verification). The framework must support libxposed API 102 on Android 17 (e.g. LSPosed 2.x / Vector 2.1+)
 - KernelSU (or another root solution) + LSPosed 2.x (libxposed API 101+)
 
 ### Usage

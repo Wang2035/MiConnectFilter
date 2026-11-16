@@ -47,7 +47,15 @@ class MainActivity : Activity() {
     private lateinit var wlBox: LinearLayout
     private lateinit var bgState: TextView
     private lateinit var bgBox: LinearLayout
+    private var bgProgressRow: LinearLayout? = null
+    private var bgProgressBar: android.widget.ProgressBar? = null
+    private var bgProgressText: TextView? = null
+
+    /** 只有用户主动导入时才让抽帧进度刷到进度条（开机自动迁移不刷）。 */
+    @Volatile
+    private var importUiActive = false
     private var pendingBgBytes: ByteArray? = null
+    private var pendingBgFile: java.io.File? = null
     private var pendingBgMime: String = "image/jpeg"
     private var pendingBgOpt: BgOpt = BgOpt.DEFAULT
     private var pendingBgFrames: Int = 0
@@ -151,6 +159,9 @@ class MainActivity : Activity() {
         @Suppress("DEPRECATION")
         window.decorView.systemUiVisibility = if (dark) 0 else View.SYSTEM_UI_FLAG_LIGHT_STATUS_BAR
         setContentView(buildUi())
+        // 上次没走完的导入残留（取消选目标等）清掉，不长期占着
+        try { java.io.File(cacheDir, "pending_bg.zip").delete() } catch (_: Throwable) {}
+        try { java.io.File(cacheDir, "bg_frames_tmp").deleteRecursively() } catch (_: Throwable) {}
         migrateNativeVideos()
     }
 
@@ -174,8 +185,10 @@ class MainActivity : Activity() {
                     val err = processBgVideoFile(tmp)
                     try { tmp.delete() } catch (_: Throwable) {}
                     val bytes = pendingBgBytes
-                    if (err == null && bytes != null) {
-                        BgStore.save(this, key, bytes, pendingBgMime)
+                    val pFile = pendingBgFile
+                    if (err == null && (bytes != null || pFile != null)) {
+                        if (pFile != null) BgStore.saveFile(this, key, pFile, pendingBgMime)
+                        else BgStore.save(this, key, bytes!!, pendingBgMime)
                         if (pendingBgFrames > 0) {
                             BgStore.setFrameInfo(this, key, pendingBgFrames, pendingBgTotalMs)
                         }
@@ -183,6 +196,10 @@ class MainActivity : Activity() {
                         changed = true
                     }
                     pendingBgBytes = null
+                    if (pFile != null) {
+                        try { pFile.delete() } catch (_: Throwable) {}
+                        pendingBgFile = null
+                    }
                     pendingBgPoster = null
                     pendingBgFrames = 0
                     pendingBgTotalMs = 0L
@@ -281,6 +298,28 @@ class MainActivity : Activity() {
             setOnClickListener { pickBgImage() }
         }
         bgCard.addView(bgAddBtn)
+        val pBar = android.widget.ProgressBar(
+            this, null, android.R.attr.progressBarStyleHorizontal,
+        ).apply {
+            max = 100
+            progressTintList =
+                android.content.res.ColorStateList.valueOf(Color.parseColor("#3482FF"))
+            layoutParams = LinearLayout.LayoutParams(
+                0, ViewGroup.LayoutParams.WRAP_CONTENT,
+            ).apply { weight = 1f }
+        }
+        val pText = txt("导入中…", 12.5f, subC).apply { setPadding(dp(10), 0, 0, 0) }
+        bgProgressBar = pBar
+        bgProgressText = pText
+        bgProgressRow = LinearLayout(this).apply {
+            orientation = LinearLayout.HORIZONTAL
+            gravity = android.view.Gravity.CENTER_VERTICAL
+            visibility = View.GONE
+            setPadding(0, dp(10), 0, dp(2))
+            addView(pBar)
+            addView(pText)
+        }
+        bgCard.addView(bgProgressRow)
         bgCard.addView(txt("照片、动态图、视频都行（视频按原帧率播放）；长按已有背景可以修改播放方式、速度和显示区域。单独给某台耳机设的优先于全部设备。", 13f, subC).apply {
             setPadding(0, dp(4), 0, dp(8))
         })
@@ -621,6 +660,32 @@ class MainActivity : Activity() {
         return rowL
     }
 
+    /** 导入进度条：只在导入期间显示；pct=null 为不确定状态（刚开始/静态图）。 */
+    private fun showImportProgress(pct: Int?) {
+        runOnUiThread {
+            val rowV = bgProgressRow ?: return@runOnUiThread
+            rowV.visibility = View.VISIBLE
+            val bar = bgProgressBar ?: return@runOnUiThread
+            if (pct == null) {
+                bar.isIndeterminate = true
+                bgProgressText?.text = "导入中…"
+            } else {
+                bar.isIndeterminate = false
+                bar.progress = pct.coerceIn(0, 100)
+                bgProgressText?.text = "导入中 ${bar.progress}%"
+            }
+        }
+    }
+
+    private fun hideImportProgress() {
+        runOnUiThread { bgProgressRow?.visibility = View.GONE }
+    }
+
+    /** 抽帧线程报进度（0–99；导入完成时进度条直接收起，不停在 100）。 */
+    private fun reportImportProgress(pct: Int) {
+        if (importUiActive) showImportProgress(pct)
+    }
+
     private fun pickBgImage() {
         val intent = Intent(Intent.ACTION_OPEN_DOCUMENT).apply {
             addCategory(Intent.CATEGORY_OPENABLE)
@@ -638,14 +703,24 @@ class MainActivity : Activity() {
         super.onActivityResult(requestCode, resultCode, data)
         if (requestCode != REQ_PICK_BG || resultCode != RESULT_OK) return
         val uri = data?.data ?: return
-        toast("正在处理…")
+        importUiActive = true
+        showImportProgress(null)
         Thread {
             val err = processBgImage(uri)
             runOnUiThread {
+                importUiActive = false
+                hideImportProgress()
                 if (err == null) {
                     pendingBgNote?.let { toast(it) }
                     pendingBgNote = null
-                    pendingBgOpt = BgOpt.DEFAULT
+                    // 重新导入：把已有背景的播放设置（模式/速度等）带进面板，
+                    // 用户不动就是沿用，清一色默认值会把调好的设置悄悄覆盖掉
+                    pendingBgOpt = BgStore.optFor(this@MainActivity, BgStore.ALL)
+                        .takeIf { it != BgOpt.DEFAULT }
+                        ?: BgStore.keys(this@MainActivity).firstNotNullOfOrNull { k ->
+                            BgStore.optFor(this@MainActivity, k).takeIf { o -> o != BgOpt.DEFAULT }
+                        }
+                        ?: BgOpt.DEFAULT
                     showBgOptionsSheet(isNew = true)
                 } else {
                     toast(err)
@@ -1067,9 +1142,12 @@ class MainActivity : Activity() {
     }
 
     private fun savePendingBg(keys: List<String>) {
-        val bytes = pendingBgBytes ?: return
+        val bytes = pendingBgBytes
+        val file = pendingBgFile
+        if (bytes == null && file == null) return
         for (key in keys) {
-            BgStore.save(this, key, bytes, pendingBgMime)
+            if (file != null) BgStore.saveFile(this, key, file, pendingBgMime)
+            else BgStore.save(this, key, bytes!!, pendingBgMime)
             BgStore.setOpt(this, key, pendingBgOpt)
             if ((pendingBgMime == "image/gif" || pendingBgMime == "video/frames") && pendingBgFrames > 0) {
                 BgStore.setFrameInfo(this, key, pendingBgFrames, pendingBgTotalMs)
@@ -1080,6 +1158,10 @@ class MainActivity : Activity() {
             }
         }
         pendingBgBytes = null
+        if (file != null) {
+            try { file.delete() } catch (_: Throwable) {}
+            pendingBgFile = null
+        }
         pendingBgFrames = 0
         pendingBgPoster = null
         refreshBgUi()
@@ -1087,8 +1169,10 @@ class MainActivity : Activity() {
         toast("背景已设置，下次弹窗生效")
     }
 
-    /** 读入所选图片存进 pending：GIF/动态 WebP 原样（≤12MB）；静态图缩到最长边 1440 存 JPEG；视频走抽帧。成功返回 null。 */
+    /** 读入所选图片存进 pending：GIF/动态 WebP 原样（≤12MB）；静态图原文件原样存（不压缩）；视频走抽帧。成功返回 null。 */
     private fun processBgImage(uri: android.net.Uri): String? {
+        pendingBgFile?.let { try { it.delete() } catch (_: Throwable) {} }
+        pendingBgFile = null
         val resolverMime = try { contentResolver.getType(uri) } catch (_: Throwable) { null }
         if (resolverMime != null && resolverMime.startsWith("video/")) {
             return processBgVideo(uri)
@@ -1096,7 +1180,7 @@ class MainActivity : Activity() {
         return try {
             val raw = contentResolver.openInputStream(uri)?.use { it.readBytes() }
                 ?: return "读不到这个文件"
-            if (raw.size > 20 * 1024 * 1024) return "文件太大了（超过 20MB）"
+            if (raw.size > 64 * 1024 * 1024) return "文件太大了（超过 64MB）"
             // 选择器没报类型的视频：MP4/MOV 的 ftyp 魔数在第 5~8 字节
             if (raw.size >= 8 && raw.copyOfRange(4, 8).toString(Charsets.US_ASCII) == "ftyp") {
                 return processBgVideo(uri)
@@ -1137,29 +1221,13 @@ class MainActivity : Activity() {
                 pendingBgMime = "image/webp"
                 return null
             }
+            // 静态图原样存：不解码、不缩放、不重压，画质零损失；
+            // 显示时弹窗端按卡片大小裁切取景（只裁切）
             val bounds = android.graphics.BitmapFactory.Options().apply { inJustDecodeBounds = true }
             android.graphics.BitmapFactory.decodeByteArray(raw, 0, raw.size, bounds)
             if (bounds.outWidth <= 0 || bounds.outHeight <= 0) return "这张图片解码失败"
-            var sample = 1
-            val maxBound = maxOf(bounds.outWidth, bounds.outHeight)
-            while (maxBound / (sample * 2) >= 1440) sample *= 2
-            val opts = android.graphics.BitmapFactory.Options().apply { inSampleSize = sample }
-            var bmp = android.graphics.BitmapFactory.decodeByteArray(raw, 0, raw.size, opts)
-                ?: return "这张图片解码失败"
-            val maxDim = maxOf(bmp.width, bmp.height)
-            if (maxDim > 1440) {
-                val scale = 1440f / maxDim
-                bmp = android.graphics.Bitmap.createScaledBitmap(
-                    bmp,
-                    (bmp.width * scale).toInt().coerceAtLeast(1),
-                    (bmp.height * scale).toInt().coerceAtLeast(1),
-                    true,
-                )
-            }
-            val out = java.io.ByteArrayOutputStream()
-            bmp.compress(android.graphics.Bitmap.CompressFormat.JPEG, 88, out)
-            pendingBgBytes = out.toByteArray()
-            pendingBgMime = "image/jpeg"
+            pendingBgBytes = raw
+            pendingBgMime = bounds.outMimeType ?: "image/jpeg"
             null
         } catch (t: Throwable) {
             "处理失败：${t.message ?: "未知错误"}"
@@ -1236,8 +1304,8 @@ class MainActivity : Activity() {
     }
 
     /**
-     * 视频导入：MP4（≤20MB）原样直放；太大或非 MP4 容器时走抽帧兜底
-     * （MediaCodec 硬解抽帧 → retriever 抓帧）。抽帧产物 hook 侧逐帧播放。
+     * 视频导入：应用进程内抽帧（MediaCodec 硬解 → retriever 抓帧兜底），
+     * 抽帧产物 hook 侧逐帧播放。
      */
     private fun processBgVideo(uri: android.net.Uri): String? {
         // 抽帧在应用进程里做：弹窗所在的蓝牙进程连媒体解析服务都被系统挡住
@@ -1270,36 +1338,51 @@ class MainActivity : Activity() {
         }
     }
 
-    /** 抽好的帧打包进 pending（视频/动态照片两条抽帧路径共用）。成功返回 null。 */
+    /**
+     * 抽好的帧打包进 pending（视频/动态照片两条抽帧路径共用）。成功返回 null。
+     * 帧已逐个落在 framesDir 里，这里流式拼成 ZIP 文件，内存里不留整包——
+     * 原画质帧包可达上百 MB，整包进内存必爆（v1.36 实测 160MB 分配失败）。
+     */
     private fun finishVideoFrames(
-        jpegs: List<ByteArray>,
+        framesDir: java.io.File,
+        frameCount: Int,
         fps: Int,
         poster: android.graphics.Bitmap?,
     ): String? {
-        if (jpegs.isEmpty()) return "这个视频读不到画面"
+        if (frameCount <= 0) return "这个视频读不到画面"
         pendingBgPoster = poster
-        if (jpegs.size == 1) {
-            pendingBgBytes = jpegs[0]
+        if (frameCount == 1) {
+            pendingBgBytes = java.io.File(framesDir, "f000.jpg").readBytes()
             pendingBgMime = "image/jpeg"
             pendingBgFrames = 0
             pendingBgTotalMs = 0L
+            try { framesDir.deleteRecursively() } catch (_: Throwable) {}
             return null
         }
-        val rawOut = java.io.ByteArrayOutputStream()
-        java.util.zip.ZipOutputStream(rawOut).use { z ->
-            z.putNextEntry(java.util.zip.ZipEntry("meta.txt"))
-            z.write("fps=$fps\n".toByteArray())
-            z.closeEntry()
-            for ((idx, jpg) in jpegs.withIndex()) {
-                z.putNextEntry(java.util.zip.ZipEntry("f%03d.jpg".format(idx)))
-                z.write(jpg)
+        val outFile = java.io.File(cacheDir, "pending_bg.zip")
+        try {
+            java.util.zip.ZipOutputStream(
+                java.io.BufferedOutputStream(java.io.FileOutputStream(outFile)),
+            ).use { z ->
+                z.setLevel(0)
+                for (i in 0 until frameCount) {
+                    val f = java.io.File(framesDir, "f%03d.jpg".format(i))
+                    z.putNextEntry(java.util.zip.ZipEntry("f%03d.jpg".format(i)))
+                    f.inputStream().use { it.copyTo(z, 64 * 1024) }
+                    z.closeEntry()
+                }
+                z.putNextEntry(java.util.zip.ZipEntry("meta.txt"))
+                z.write("fps=$fps\n".toByteArray())
                 z.closeEntry()
             }
+        } catch (t: Throwable) {
+            return "视频打包失败：${t.message ?: "未知错误"}"
         }
-        pendingBgBytes = rawOut.toByteArray()
+        try { framesDir.deleteRecursively() } catch (_: Throwable) {}
+        pendingBgFile = outFile
         pendingBgMime = "video/frames"
-        pendingBgFrames = jpegs.size
-        pendingBgTotalMs = jpegs.size * (1000L / fps)
+        pendingBgFrames = frameCount
+        pendingBgTotalMs = frameCount * (1000L / fps)
         return null
     }
 
@@ -1309,6 +1392,7 @@ class MainActivity : Activity() {
     ): String? {
         val extractor = android.media.MediaExtractor()
         var codec: android.media.MediaCodec? = null
+        var encPool: java.util.concurrent.ExecutorService? = null
         try {
             configure(extractor)
             var track = -1
@@ -1348,14 +1432,10 @@ class MainActivity : Activity() {
             val swapped = rotation == 90 || rotation == 270
             val estW = if (swapped) codedH else codedW
             val estH = if (swapped) codedW else codedH
-            val estPx = if (estW > 0 && estH > 0) {
-                val s = if (maxOf(estW, estH) > 640) 640f / maxOf(estW, estH) else 1f
-                (estW * s).toInt().coerceAtLeast(1) * (estH * s).toInt().coerceAtLeast(1)
-            } else {
-                640 * 360
-            }
+            // 原画质：帧按源分辨率抽，不缩放；预算只管总帧数/总像素（防超长视频爆内存）
+            val estPx = if (estW > 0 && estH > 0) estW * estH else 1280 * 720
             // 按原帧率抽：从源帧率起步，只有帧数/总像素超预算才逐档降
-            // （上限 8 秒、400 帧、1 亿像素；他的 3.7 秒动态照片是全帧原样抽）
+            // （上限 8 秒、300 帧、5 亿像素；短视频全帧原样抽）
             val usableUs = if (durationUs > 0) minOf(durationUs, 8_000_000L) else 8_000_000L
             val nativeClamped = nativeFps.coerceIn(1, 60)
             val ladder = (listOf(nativeClamped) +
@@ -1364,7 +1444,7 @@ class MainActivity : Activity() {
             var fps = ladder.last()
             for (cand in ladder) {
                 val n = (usableUs / 1_000_000.0 * cand).toInt().coerceAtLeast(1)
-                if (n <= 400 && n * estPx <= 100_000_000) {
+                if (n <= 300 && n.toLong() * estPx <= 500_000_000L) {
                     fps = cand
                     break
                 }
@@ -1374,8 +1454,24 @@ class MainActivity : Activity() {
             codec = android.media.MediaCodec.createDecoderByType(mime)
             codec.configure(format, null, null, 0)
             codec.start()
-            val jpegs = ArrayList<ByteArray>()
+            // JPEG 编码并行化：解码在本线程顺序走，最耗时的编码交给 4 个线程同时压；
+            // 在途位图用信号量限住防爆内存；结果带序号收集，解码结束后按序组装
+            val pool = java.util.concurrent.Executors.newFixedThreadPool(4)
+            encPool = pool
+            val encSlots = java.util.concurrent.Semaphore(5)
+            val encErr = java.util.concurrent.atomic.AtomicReference<Throwable?>(null)
+            val encDone = java.util.concurrent.atomic.AtomicInteger(0)
+            val expectedTotal = maxOf(
+                1,
+                (usableUs / 1_000_000.0 * (if (takeAll) nativeClamped else fps)).toInt(),
+            )
+            var frameIdx = 0
             var poster: android.graphics.Bitmap? = null
+            // 帧逐个落临时文件、最后流式拼包：原画质帧包可达上百 MB，整包进内存会爆
+            val framesDir = java.io.File(cacheDir, "bg_frames_tmp").apply {
+                try { deleteRecursively() } catch (_: Throwable) {}
+                mkdirs()
+            }
             var nextWantedUs = 0L
             var firstTakenPts = -1L
             var lastTakenPts = 0L
@@ -1420,20 +1516,30 @@ class MainActivity : Activity() {
                                     bmp, 0, 0, bmp.width, bmp.height, mt, true,
                                 )
                             }
-                            val md = maxOf(bmp.width, bmp.height)
-                            if (md > 640) {
-                                val s = 640f / md
-                                bmp = android.graphics.Bitmap.createScaledBitmap(
-                                    bmp,
-                                    (bmp.width * s).toInt().coerceAtLeast(1),
-                                    (bmp.height * s).toInt().coerceAtLeast(1),
-                                    true,
-                                )
-                            }
                             if (poster == null) poster = bmp
-                            val baos = java.io.ByteArrayOutputStream()
-                            bmp.compress(android.graphics.Bitmap.CompressFormat.JPEG, 82, baos)
-                            jpegs.add(baos.toByteArray())
+                            val encIdx = frameIdx++
+                            val encBmp = bmp
+                            encSlots.acquire()
+                            pool.execute {
+                                try {
+                                    java.io.File(framesDir, "f%03d.jpg".format(encIdx))
+                                        .outputStream().use {
+                                            encBmp.compress(
+                                                android.graphics.Bitmap.CompressFormat.JPEG,
+                                                100, it,
+                                            )
+                                        }
+                                    if (encIdx != 0) {
+                                        try { encBmp.recycle() } catch (_: Throwable) {}
+                                    }
+                                    val d = encDone.incrementAndGet()
+                                    reportImportProgress(minOf(99, d * 100 / expectedTotal))
+                                } catch (t: Throwable) {
+                                    encErr.compareAndSet(null, t)
+                                } finally {
+                                    encSlots.release()
+                                }
+                            }
                             if (firstTakenPts < 0) firstTakenPts = pts
                             lastTakenPts = pts
                             if (takeAll) {
@@ -1447,17 +1553,23 @@ class MainActivity : Activity() {
                     if (eos || pts > usableUs + intervalUs) outputDone = true
                 }
             }
+            pool.shutdown()
+            if (!pool.awaitTermination(60, java.util.concurrent.TimeUnit.SECONDS)) {
+                return "视频编码超时"
+            }
+            encErr.get()?.let { return "视频编码失败：${it.message ?: "未知错误"}" }
             // 全帧抽时用实际帧间隔反推帧率（变帧率源也贴近原速）
-            val fpsEff = if (takeAll && jpegs.size >= 2 && lastTakenPts > firstTakenPts) {
-                ((jpegs.size - 1) * 1_000_000L / (lastTakenPts - firstTakenPts))
+            val fpsEff = if (takeAll && frameIdx >= 2 && lastTakenPts > firstTakenPts) {
+                ((frameIdx - 1) * 1_000_000L / (lastTakenPts - firstTakenPts))
                     .toInt().coerceIn(1, 120)
             } else {
                 fps
             }
-            return finishVideoFrames(jpegs, fpsEff, poster)
+            return finishVideoFrames(framesDir, frameIdx, fpsEff, poster)
         } catch (t: Throwable) {
             return "视频解码失败：${t.message ?: "未知错误"}"
         } finally {
+            try { encPool?.shutdownNow() } catch (_: Throwable) {}
             try { codec?.stop() } catch (_: Throwable) {}
             try { codec?.release() } catch (_: Throwable) {}
             try { extractor.release() } catch (_: Throwable) {}
@@ -1493,16 +1605,23 @@ class MainActivity : Activity() {
         return out
     }
 
+    // YUV→RGB 查表：与逐像素整数公式逐位一致，省掉每像素的乘法，转换快数倍
+    private val yuvTabY = IntArray(256) { 1192 * (it - 16).coerceAtLeast(0) }
+    private val yuvTabRv = IntArray(256) { 1634 * (it - 128) }
+    private val yuvTabGv = IntArray(256) { -833 * (it - 128) }
+    private val yuvTabGu = IntArray(256) { -400 * (it - 128) }
+    private val yuvTabBu = IntArray(256) { 2066 * (it - 128) }
+
     /**
      * MediaCodec 输出的 YUV_420_888 转 Bitmap（整数 BT.601，颜色公式与旧版一致）。
-     * 采样转换：长边按步长抽样直接出 ≤640 的小图，转换像素数降到原来的几分之一，
-     * 再加整行 bulk 拷贝，抽帧速度比旧版逐像素全尺寸转换快数倍。
+     * 长边封顶 1600 采样转换：弹窗卡片只有 1440 宽，再大的帧肉眼无差别，却让帧包
+     * 体积、传输与弹窗端解码慢好几倍（掉帧主因之一）；整行 bulk 拷贝 + 数组内循环。
      */
     private fun yuvImageToBitmap(image: android.media.Image): android.graphics.Bitmap {
         val crop = image.cropRect
         val w = crop.width()
         val h = crop.height()
-        val step = maxOf(1, (maxOf(w, h) + 639) / 640)
+        val step = maxOf(1, (maxOf(w, h) + 1599) / 1600)
         val outW = (w + step - 1) / step
         val outH = (h + step - 1) / step
         val cw = (w + 1) / 2
@@ -1520,12 +1639,12 @@ class MainActivity : Activity() {
             for (ox in 0 until outW) {
                 val yv = yArr[yRow + sx].toInt() and 0xFF
                 val ci = cRow + sx / 2
-                val uv = (uArr[ci].toInt() and 0xFF) - 128
-                val vv = (vArr[ci].toInt() and 0xFF) - 128
-                val y1192 = 1192 * (yv - 16).coerceAtLeast(0)
-                val r = ((y1192 + 1634 * vv) shr 10).coerceIn(0, 255)
-                val g = ((y1192 - 833 * vv - 400 * uv) shr 10).coerceIn(0, 255)
-                val b = ((y1192 + 2066 * uv) shr 10).coerceIn(0, 255)
+                val ur = uArr[ci].toInt() and 0xFF
+                val vr = vArr[ci].toInt() and 0xFF
+                val y1192 = yuvTabY[yv]
+                val r = ((y1192 + yuvTabRv[vr]) shr 10).coerceIn(0, 255)
+                val g = ((y1192 + yuvTabGv[vr] + yuvTabGu[ur]) shr 10).coerceIn(0, 255)
+                val b = ((y1192 + yuvTabBu[ur]) shr 10).coerceIn(0, 255)
                 pixels[dst++] = (0xFF shl 24) or (r shl 16) or (g shl 8) or b
                 sx += step
             }
@@ -1556,23 +1675,22 @@ class MainActivity : Activity() {
             val swapped = rotation == 90 || rotation == 270
             val estW = if (swapped) vh else vw
             val estH = if (swapped) vw else vh
-            val estPx = if (estW > 0 && estH > 0) {
-                val s = if (maxOf(estW, estH) > 640) 640f / maxOf(estW, estH) else 1f
-                (estW * s).toInt().coerceAtLeast(1) * (estH * s).toInt().coerceAtLeast(1)
-            } else {
-                640 * 360
-            }
-            val usableMs = minOf(durationMs, 6000L)
+            val estPx = if (estW > 0 && estH > 0) estW * estH else 1280 * 720
+            val usableMs = minOf(durationMs, 8000L)
             var fps = 8
             for (cand in listOf(60, 48, 30, 24, 20, 15, 12, 10, 8)) {
                 val n = (usableMs * cand / 1000).toInt().coerceAtLeast(1)
-                if (n * estPx <= 45_000_000) {
+                if (n <= 300 && n.toLong() * estPx <= 500_000_000L) {
                     fps = cand
                     break
                 }
             }
             val frameCount = (usableMs * fps / 1000).toInt().coerceAtLeast(1)
-            val jpegs = ArrayList<ByteArray>()
+            val framesDir = java.io.File(cacheDir, "bg_frames_tmp").apply {
+                try { deleteRecursively() } catch (_: Throwable) {}
+                mkdirs()
+            }
+            var taken = 0
             var poster: android.graphics.Bitmap? = null
             for (i in 0 until frameCount) {
                 val timeUs = i * 1_000_000L / fps
@@ -1583,22 +1701,31 @@ class MainActivity : Activity() {
                     val m = android.graphics.Matrix().apply { postRotate(rotation.toFloat()) }
                     bmp = android.graphics.Bitmap.createBitmap(bmp, 0, 0, bmp.width, bmp.height, m, true)
                 }
-                val md = maxOf(bmp.width, bmp.height)
-                if (md > 640) {
-                    val s = 640f / md
-                    bmp = android.graphics.Bitmap.createScaledBitmap(
+                val longEdge = maxOf(bmp.width, bmp.height)
+                if (longEdge > 1600) {
+                    val sc = 1600f / longEdge
+                    val scaled = android.graphics.Bitmap.createScaledBitmap(
                         bmp,
-                        (bmp.width * s).toInt().coerceAtLeast(1),
-                        (bmp.height * s).toInt().coerceAtLeast(1),
+                        (bmp.width * sc).toInt().coerceAtLeast(1),
+                        (bmp.height * sc).toInt().coerceAtLeast(1),
                         true,
                     )
+                    if (scaled !== bmp) {
+                        try { bmp.recycle() } catch (_: Throwable) {}
+                        bmp = scaled
+                    }
                 }
                 if (poster == null) poster = bmp
-                val baos = java.io.ByteArrayOutputStream()
-                bmp.compress(android.graphics.Bitmap.CompressFormat.JPEG, 82, baos)
-                jpegs.add(baos.toByteArray())
+                java.io.File(framesDir, "f%03d.jpg".format(taken)).outputStream().use {
+                    bmp.compress(android.graphics.Bitmap.CompressFormat.JPEG, 100, it)
+                }
+                if (bmp !== poster) {
+                    try { bmp.recycle() } catch (_: Throwable) {}
+                }
+                taken++
+                reportImportProgress(minOf(99, taken * 100 / frameCount))
             }
-            return finishVideoFrames(jpegs, fps, poster)
+            return finishVideoFrames(framesDir, taken, fps, poster)
         } catch (t: Throwable) {
             return "视频处理失败：${t.message ?: "未知错误"}"
         }

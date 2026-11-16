@@ -112,6 +112,17 @@ class MiConnectModule : XposedModule() {
     private val bgCache = HashMap<String, ByteArray>()
     private val bgCacheVer = HashMap<String, Long>()
     private val bgMissing = HashSet<String>()
+    private val bgMissingAt = HashMap<String, Long>()
+
+    private fun markBgMissing(key: String) {
+        bgMissing.add(key)
+        bgMissingAt[key] = SystemClock.elapsedRealtime()
+    }
+
+    private fun clearBgMissing(key: String) {
+        bgMissing.remove(key)
+        bgMissingAt.remove(key)
+    }
     private val bgInFlight = HashSet<String>()
     /** GIF 帧缓存："key:ver" -> 帧位图/帧时长（拉取线程里解好，贴图时直接用）。 */
     private val bgGifFrames = HashMap<String, List<android.graphics.Bitmap>>()
@@ -119,11 +130,16 @@ class MiConnectModule : XposedModule() {
     private val bgGifDelays = HashMap<String, IntArray>()
     /** 视频帧包缓存："key:ver" -> 懒解码帧源（只存 JPEG 字节，画到哪帧解哪帧，省 CPU/内存）。 */
     private val bgLazyFrames = HashMap<String, LazyFrames>()
+    private val bgBundleVer = HashMap<String, Long>()
     @Volatile private var pendingBgRoot: WeakReference<View>? = null
     @Volatile private var pendingBgMac: String? = null
     @Volatile private var pendingBgCtx: Context? = null
+    @Volatile private var lastBgRoot: WeakReference<View>? = null
+    @Volatile private var lastBgMac: String? = null
     /** 已贴好背景的窗口根 -> "key:ver"，防重复贴、版本变了重贴。 */
     private val bgRootTokens: MutableMap<View, String> =
+        Collections.synchronizedMap(WeakHashMap())
+    private val cardBgTokens: MutableMap<View, String> =
         Collections.synchronizedMap(WeakHashMap())
 
     private fun applyPopupBackground(activity: Activity, mac: String?) {
@@ -179,11 +195,35 @@ class MiConnectModule : XposedModule() {
 
     private fun decorateRoot(root: View, mac: String?, appCtx: Context) {
         try {
+            lastBgRoot = WeakReference(root)
+            lastBgMac = mac
             // 候选按序尝试：专属图拉不到（已删/拉取失败）就回退「全部设备」图，
             // 不再像旧版那样卡在失效的专属 key 上、把 all 也挡死。
             for (key in config.bgKeysFor(mac)) {
                 val ver = config.bgMap[key] ?: continue
                 if (ver <= 0L) continue
+                val bundleReady = synchronized(bgLock) {
+                    val lf = bgLazyFrames["$key:$ver"]
+                    if (bgBundleVer[key] == ver && lf != null) {
+                        val f = lf.file
+                        if (f != null && f.exists()) {
+                            true
+                        } else {
+                            // 缓存文件被系统清掉：丢掉失效帧源，回落到重新拉取
+                            lf.close()
+                            bgLazyFrames.remove("$key:$ver")
+                            bgBundleVer.remove(key)
+                            false
+                        }
+                    } else {
+                        false
+                    }
+                }
+                if (bundleReady) {
+                    // 帧包走文件懒帧源：buildBgContent 优先取懒帧，bytes 只是占位
+                    decorateWithBytes(root, ByteArray(0), key, ver, 0)
+                    return
+                }
                 val ready = synchronized(bgLock) {
                     if (bgCacheVer[key] == ver && key !in bgMissing) bgCache[key] else null
                 }
@@ -192,14 +232,41 @@ class MiConnectModule : XposedModule() {
                     return
                 }
                 val knownMissing = synchronized(bgLock) {
-                    key in bgMissing && bgCacheVer[key] == ver
+                    if (key in bgMissing && bgCacheVer[key] == ver) {
+                        val at = bgMissingAt[key]
+                        if (at != null && SystemClock.elapsedRealtime() - at < 15_000L) {
+                            true
+                        } else {
+                            // 失败已超 15 秒：清掉闩锁，这次弹窗重新拉一次
+                            bgMissing.remove(key)
+                            bgMissingAt.remove(key)
+                            false
+                        }
+                    } else {
+                        false
+                    }
                 }
                 if (knownMissing) continue
+                log("BGFETCH", null, "start key=$key ver=$ver pkg=$targetPackage")
+                lg("bgfetch start key=$key ver=$ver pkg=$targetPackage")
                 pendingBgRoot = WeakReference(root)
                 pendingBgMac = mac
                 pendingBgCtx = appCtx
                 fetchBgBytes(appCtx, key, ver)
                 return
+            }
+        } catch (_: Throwable) {}
+    }
+
+    /** 配置一到就预热背景：本地有缓存包直接解析、没有就后台拉，弹窗出现时立即有背景。 */
+    private fun prewarmBg(ctx: Context) {
+        try {
+            for ((key, ver) in config.bgMap) {
+                val ready = synchronized(bgLock) {
+                    (bgLazyFrames["$key:$ver"] != null && bgBundleVer[key] == ver) ||
+                        (bgCache.containsKey(key) && bgCacheVer[key] == ver)
+                }
+                if (!ready) fetchBgBytes(ctx, key, ver)
             }
         } catch (_: Throwable) {}
     }
@@ -210,29 +277,143 @@ class MiConnectModule : XposedModule() {
         }
         Thread {
             try {
-                val bytes = ctx.contentResolver.openInputStream(Uri.parse(ConfigBus.bgUri(key)))?.use { ins ->
-                    val buf = ByteArrayOutputStream()
-                    val tmp = ByteArray(64 * 1024)
-                    var total = 0
-                    while (true) {
-                        val n = ins.read(tmp)
-                        if (n <= 0) break
-                        total += n
-                        if (total > 24 * 1024 * 1024) break
-                        buf.write(tmp, 0, n)
+                // 本进程缓存里已有同版本帧包（进程重启后包还在）：直接解析，省掉整包重传
+                val permPre = java.io.File(ctx.cacheDir, "mcf_bg_${key}_$version.zip")
+                if (permPre.isFile && permPre.length() > 0L) {
+                    val cached = try { parseBundleFile(permPre) } catch (_: Throwable) { null }
+                    if (cached != null) {
+                        synchronized(bgLock) {
+                            val mapKey = "$key:$version"
+                            bgLazyFrames[mapKey]?.close()
+                            bgLazyFrames[mapKey] = cached
+                            bgBundleVer[key] = version
+                            clearBgMissing(key)
+                        }
+                        try { cached.prefetch(0) } catch (_: Throwable) {}
+                        lg("bg bundle from cache key=$key frames=${cached.size} pkg=$targetPackage")
+                        log("BGFETCH", null, "bundle cached key=$key frames=${cached.size} pkg=$targetPackage")
+                        val root0 = pendingBgRoot?.get()
+                        val c0 = pendingBgCtx
+                        if (root0 != null && c0 != null) decorateRoot(root0, pendingBgMac, c0)
+                        return@Thread
                     }
-                    buf.toByteArray()
                 }
-                synchronized(bgLock) {
-                    if (bytes != null && bytes.isNotEmpty()) {
-                        bgCache[key] = bytes
-                        bgMissing.remove(key)
+                // 流式下载到本进程缓存文件再分流：原画质帧包可达上百 MB，
+                // 整包读进内存会爆，超过上限还会被截断成坏包
+                val dlTmp = java.io.File(ctx.cacheDir, "mcf_bg_dl_$key.tmp")
+                var dlTotal = 0L
+                val head = ByteArray(8)
+                var headLen = 0
+                // 期望长度（提供方文件大小）：传输中途断了能当场发现并重试一次，
+                // 别把截断的坏包当成功（坏包解析失败再叠加失败闩锁，就是「只有重导才显示」）
+                val expectedLen = try {
+                    ctx.contentResolver.openAssetFileDescriptor(
+                        Uri.parse(ConfigBus.bgUri(key)), "r",
+                    )?.use { it.length } ?: -1L
+                } catch (_: Throwable) {
+                    -1L
+                }
+                var dlOk = false
+                for (attempt in 0..1) {
+                    dlTotal = 0L
+                    headLen = 0
+                    val okOnce = try {
+                        ctx.contentResolver.openInputStream(
+                            Uri.parse(ConfigBus.bgUri(key)),
+                        )?.use { ins ->
+                            java.io.FileOutputStream(dlTmp).use { out ->
+                                val buf = ByteArray(64 * 1024)
+                                while (true) {
+                                    val n = ins.read(buf)
+                                    if (n <= 0) break
+                                    if (headLen < head.size) {
+                                        val c = minOf(n, head.size - headLen)
+                                        System.arraycopy(buf, 0, head, headLen, c)
+                                        headLen += c
+                                    }
+                                    out.write(buf, 0, n)
+                                    dlTotal += n
+                                    if (dlTotal > 256L * 1024 * 1024) break
+                                }
+                            }
+                            true
+                        } ?: false
+                    } catch (_: Throwable) {
+                        false
+                    }
+                    if (okOnce && (expectedLen <= 0L || dlTotal == expectedLen)) {
+                        dlOk = true
+                        break
+                    }
+                    log(
+                        "BGFETCH", null,
+                        "retry key=$key attempt=$attempt got=$dlTotal want=$expectedLen pkg=$targetPackage",
+                    )
+                }
+                var bytes: ByteArray? = null
+                if (dlOk && dlTotal > 0L && headLen >= 2 &&
+                    head[0] == 0x50.toByte() && head[1] == 0x4B.toByte()
+                ) {
+                    // 视频帧包：转正到缓存文件，ZipFile 随机访问逐帧读，内存只留解码缓存
+                    val perm = java.io.File(ctx.cacheDir, "mcf_bg_${key}_$version.zip")
+                    try { dlTmp.copyTo(perm, overwrite = true) } catch (_: Throwable) {}
+                    val parsed = parseBundleFile(perm)
+                    synchronized(bgLock) {
+                        val mapKey = "$key:$version"
+                        val old = bgLazyFrames[mapKey]
+                        if (parsed != null) {
+                            if (old != null && old !== parsed) {
+                                old.close()
+                                old.file?.let {
+                                    if (it.absolutePath != perm.absolutePath) {
+                                        try { it.delete() } catch (_: Throwable) {}
+                                    }
+                                }
+                            }
+                            bgLazyFrames[mapKey] = parsed
+                            bgBundleVer[key] = version
+                            clearBgMissing(key)
+                            try { parsed.prefetch(0) } catch (_: Throwable) {}
+                            log(
+                                "BGFETCH", null,
+                                "bundle ok key=$key frames=${parsed.size} bytes=$dlTotal pkg=$targetPackage",
+                            )
+                        } else {
+                            markBgMissing(key)
+                            log(
+                                "BGFETCH", null,
+                                "bundle parse failed key=$key bytes=$dlTotal pkg=$targetPackage",
+                            )
+                            try { perm.delete() } catch (_: Throwable) {}
+                        }
+                        bgCacheVer[key] = version
+                    }
+                    try {
+                        ctx.cacheDir.listFiles()?.forEach { f ->
+                            if (f.name.startsWith("mcf_bg_${key}_") && f.name != perm.name) {
+                                try { f.delete() } catch (_: Throwable) {}
+                            }
+                        }
+                    } catch (_: Throwable) {}
+                    lg("bg bundle fetched key=$key version=$version bytes=$dlTotal pkg=$targetPackage")
+                } else {
+                    bytes = if (dlOk && dlTotal > 0L) {
+                        try { dlTmp.readBytes() } catch (_: Throwable) { null }
                     } else {
-                        bgCache.remove(key)
-                        bgMissing.add(key)
+                        null
                     }
-                    bgCacheVer[key] = version
+                    synchronized(bgLock) {
+                        if (bytes != null && bytes.isNotEmpty()) {
+                            bgCache[key] = bytes
+                            clearBgMissing(key)
+                        } else {
+                            bgCache.remove(key)
+                            markBgMissing(key)
+                        }
+                        bgCacheVer[key] = version
+                    }
                 }
+                try { dlTmp.delete() } catch (_: Throwable) {}
                 // 原视频：先抓一张海报帧兜底（解码器出帧前先有图可画，解码失败也不空）
                 if (bytes != null && bytes.size >= 8 &&
                     bytes.copyOfRange(4, 8).toString(Charsets.US_ASCII) == "ftyp"
@@ -294,29 +475,22 @@ class MiConnectModule : XposedModule() {
                         lg("bg gif decode failed key=$key: ${t.message}")
                     }
                 }
-                // 视频帧包（ZIP）：只拆包不解码，帧源懒解码（画到才解），弹窗打开快、平时不耗电
-                if (bytes != null && bytes.size >= 2 &&
-                    bytes[0] == 0x50.toByte() && bytes[1] == 0x4B.toByte()
-                ) {
-                    val parsed = parseBundle(bytes)
-                    if (parsed != null) {
-                        synchronized(bgLock) {
-                            bgLazyFrames["$key:$version"] = parsed
-                        }
-                        lg("bg video frames parsed key=$key frames=${parsed.size}")
-                    }
-                }
                 lg("bg fetched key=$key version=$version bytes=${bytes?.size ?: -1} pkg=$targetPackage")
+                if (bytes != null && bytes.isNotEmpty()) {
+                    log("BGFETCH", null, "bytes ok key=$key bytes=${bytes.size} pkg=$targetPackage")
+                }
                 val root = pendingBgRoot?.get()
                 val c = pendingBgCtx
                 if (root != null && c != null) decorateRoot(root, pendingBgMac, c)
             } catch (t: Throwable) {
                 synchronized(bgLock) {
                     bgCache.remove(key)
-                    bgMissing.add(key)
+                    markBgMissing(key)
                     bgCacheVer[key] = version
                 }
                 lg("bg fetch failed key=$key version=$version pkg=$targetPackage: ${t.message}")
+                log("BGFETCH", null, "failed2 key=$key ver=$version err=${t.message} pkg=$targetPackage")
+                log("BGFETCH", null, "failed key=$key ver=$version err=${t.message} pkg=$targetPackage")
             } finally {
                 synchronized(bgLock) { bgInFlight.remove(key) }
             }
@@ -343,49 +517,71 @@ class MiConnectModule : XposedModule() {
     }
 
     /**
-     * 视频帧包（ZIP：meta.txt 记 fps，fNNN.jpg 为帧）拆包成懒帧源：只留 JPEG 字节不解码。
-     * 总像素预算靠第一帧的尺寸估算（只读 JPEG 头），超了就抽帧、帧时长加倍补偿。
+     * 视频帧包文件（ZIP：meta.txt 记 fps，fNNN.jpg 为帧）拆成懒帧源：ZipFile 随机访问，
+     * 帧字节按需从文件读，不整包进内存。总像素预算靠第一帧尺寸估算，超了抽帧、帧时长加倍补偿。
      */
-    private fun parseBundle(bytes: ByteArray): LazyFrames? {
+    private fun parseBundleFile(file: java.io.File): LazyFrames? {
         return try {
+            val zip = java.util.zip.ZipFile(file)
             var fps = 10
-            val entries = ArrayList<Pair<String, ByteArray>>()
-            java.util.zip.ZipInputStream(java.io.ByteArrayInputStream(bytes)).use { z ->
-                while (true) {
-                    val e = z.nextEntry ?: break
-                    val data = z.readBytes()
-                    if (e.name == "meta.txt") {
-                        val m = Regex("fps=(\\d+)").find(data.toString(Charsets.US_ASCII))
-                        fps = m?.groupValues?.get(1)?.toIntOrNull()?.coerceIn(1, 120) ?: 10
-                    } else if (e.name.endsWith(".jpg")) {
-                        entries.add(e.name to data)
-                    }
-                    z.closeEntry()
+            val names = ArrayList<String>()
+            val en = zip.entries()
+            while (en.hasMoreElements()) {
+                val e = en.nextElement()
+                if (e.name == "meta.txt") {
+                    val text = zip.getInputStream(e).use { it.readBytes() }
+                        .toString(Charsets.US_ASCII)
+                    val m = Regex("fps=(\\d+)").find(text)
+                    fps = m?.groupValues?.get(1)?.toIntOrNull()?.coerceIn(1, 120) ?: 10
+                } else if (e.name.endsWith(".jpg")) {
+                    names.add(e.name)
                 }
             }
-            entries.sortBy { it.first }
-            if (entries.size < 2) return null
-            var jpegs: List<ByteArray> = entries.map { it.second }
+            names.sort()
+            if (names.size < 2) {
+                try { zip.close() } catch (_: Throwable) {}
+                return null
+            }
+            val first = zip.getEntry(names[0])?.let {
+                zip.getInputStream(it).use { st -> st.readBytes() }
+            }
             val boundsOpts = BitmapFactory.Options().apply { inJustDecodeBounds = true }
-            BitmapFactory.decodeByteArray(jpegs[0], 0, jpegs[0].size, boundsOpts)
+            if (first != null) {
+                BitmapFactory.decodeByteArray(first, 0, first.size, boundsOpts)
+            }
             val px = boundsOpts.outWidth.toLong() * boundsOpts.outHeight.toLong()
             var delay = 1000 / fps
+            var keep = names
             if (px > 0) {
-                while (jpegs.size > 2 && px * jpegs.size > 200_000_000L) {
-                    val next = ArrayList<ByteArray>()
+                while (keep.size > 2 && px * keep.size > 200_000_000L) {
+                    val next = ArrayList<String>()
                     var i = 0
-                    while (i < jpegs.size) {
-                        next.add(jpegs[i])
+                    while (i < keep.size) {
+                        next.add(keep[i])
                         i += 2
                     }
-                    jpegs = next
+                    keep = next
                     delay *= 2
                 }
             }
-            LazyFrames(jpegs, IntArray(jpegs.size) { delay })
+            LazyFrames(zip, keep, IntArray(keep.size) { delay })
         } catch (_: Throwable) {
             null
         }
+    }
+
+    /**
+     * 静态图解码：只在解码时按 2 的幂采样到长边 ≤2880（存的文件不动、画质不减），
+     * 防超大原图照片在弹窗进程里全尺寸解码爆内存。
+     */
+    private fun decodeSampled(bytes: ByteArray): android.graphics.Bitmap? {
+        val bounds = BitmapFactory.Options().apply { inJustDecodeBounds = true }
+        BitmapFactory.decodeByteArray(bytes, 0, bytes.size, bounds)
+        var sample = 1
+        val maxDim = maxOf(bounds.outWidth, bounds.outHeight)
+        while (maxDim / (sample * 2) >= 2880) sample *= 2
+        val opts = BitmapFactory.Options().apply { inSampleSize = sample }
+        return BitmapFactory.decodeByteArray(bytes, 0, bytes.size, opts)
     }
 
     private fun buildBgContent(bytes: ByteArray, key: String, version: Long): BgContent? {
@@ -410,7 +606,18 @@ class MiConnectModule : XposedModule() {
         if (GifDecoder.isGif(bytes)) {
             // 只有 1 帧或解码没跟上：当静态图用第一帧
             return try {
-                BitmapFactory.decodeByteArray(bytes, 0, bytes.size)?.let { BgContent(bitmap = it) }
+                decodeSampled(bytes)?.let { BgContent(bitmap = it) }
+            } catch (_: Throwable) {
+                null
+            }
+        }
+        // JPEG/PNG 静态图：采样解码，不走 ImageDecoder 全尺寸解码
+        if (bytes.size >= 4 &&
+            ((bytes[0] == 0xFF.toByte() && bytes[1] == 0xD8.toByte()) ||
+                (bytes[0] == 0x89.toByte() && bytes[1] == 0x50.toByte()))
+        ) {
+            return try {
+                decodeSampled(bytes)?.let { BgContent(bitmap = it) }
             } catch (_: Throwable) {
                 null
             }
@@ -433,7 +640,7 @@ class MiConnectModule : XposedModule() {
             } catch (_: Throwable) {}
         }
         return try {
-            BitmapFactory.decodeByteArray(bytes, 0, bytes.size)?.let { BgContent(bitmap = it) }
+            decodeSampled(bytes)?.let { BgContent(bitmap = it) }
         } catch (_: Throwable) {
             null
         }
@@ -441,7 +648,7 @@ class MiConnectModule : XposedModule() {
 
     /**
      * 把图片贴进窗口里的卡片。窗口刚建时尺寸还没量出来、内容可能还没塞完，
-     * 所以带重试多试几次（0/200/400/800ms）。
+     * 所以带重试多试几次（0/200/400/800/1500/2500/4000ms，内容挂得晚也能赶上）。
      */
     private fun decorateWithBytes(root: View, bytes: ByteArray, key: String, version: Long, attempt: Int) {
         root.post {
@@ -453,10 +660,14 @@ class MiConnectModule : XposedModule() {
                     restartCardBg(root)
                 } else {
                     val card = findCardIn(root)
-                    if (card != null) {
+                    if (card != null && cardBgTokens[card] == token) {
+                        // 同一张卡已经贴着同版本背景：只补 start，不重建（重建会从头播）
+                        restartCardBg(root)
+                    } else if (card != null) {
                         val content = buildBgContent(bytes, key, version)
                         if (content != null && applyToCard(card, content, key)) {
                             bgRootTokens[root] = token
+                            cardBgTokens[card] = token
                             log(
                                 "BGAPPLY", null,
                                 "key=$key kind=${content.kind} bytes=${bytes.size} pkg=$targetPackage",
@@ -467,7 +678,7 @@ class MiConnectModule : XposedModule() {
                             )
                             if (config.debug) dumpHierarchy(root)
                         }
-                    } else if (attempt >= 3) {
+                    } else if (attempt >= 6) {
                         // 找不到卡片就放弃（旧版垫整窗兜底会糊满屏，已删）
                         lg("bg: no card found in window root=${root.javaClass.simpleName}")
                         if (config.debug) dumpHierarchy(root)
@@ -475,13 +686,16 @@ class MiConnectModule : XposedModule() {
                 }
             } catch (_: Throwable) {}
         }
-        if (attempt < 3) {
+        if (attempt < 6) {
             root.postDelayed(
                 { decorateWithBytes(root, bytes, key, version, attempt + 1) },
                 when (attempt) {
                     0 -> 200L
                     1 -> 400L
-                    else -> 800L
+                    2 -> 800L
+                    3 -> 1500L
+                    4 -> 2500L
+                    else -> 4000L
                 },
             )
         }
@@ -670,6 +884,7 @@ class MiConnectModule : XposedModule() {
         val bus = busConfig
         if (bus != null) {
             config = bus
+            maybeCleanupBg()
             return
         }
         val f = FilterConfig.load(CONF_FILE)
@@ -679,6 +894,91 @@ class MiConnectModule : XposedModule() {
             config = f
             configSource = "file"
         }
+        maybeCleanupBg()
+    }
+
+    @Volatile private var lastCleanedBgMap: Map<String, Long>? = null
+
+    /**
+     * 背景集合变了（删除/替换）时，清掉不再被引用的帧包文件与内存帧源：
+     * 用户在设置里删掉的背景，不能在弹窗进程的缓存目录里一直留着。
+     * 配置没变时零开销（快照比对后直接返回）。
+     */
+    private fun maybeCleanupBg() {
+        val ctx = appContext ?: return
+        val current = config.bgMap
+        if (lastCleanedBgMap == current) return
+        lastCleanedBgMap = current
+        Thread {
+            try {
+                val stale = synchronized(bgLock) {
+                    val out = ArrayList<LazyFrames>()
+                    val it = bgLazyFrames.entries.iterator()
+                    while (it.hasNext()) {
+                        val e = it.next()
+                        val k = e.key.substringBefore(':')
+                        val v = e.key.substringAfter(':').toLongOrNull()
+                        if (current[k] != v) {
+                            out.add(e.value)
+                            it.remove()
+                            if (bgBundleVer[k] == v) bgBundleVer.remove(k)
+                        }
+                    }
+                    out
+                }
+                for (lf in stale) {
+                    lf.close()
+                    lf.file?.let { try { it.delete() } catch (_: Throwable) {} }
+                }
+                synchronized(bgLock) {
+                    val kit = bgCache.keys.iterator()
+                    while (kit.hasNext()) {
+                        if (kit.next() !in current) kit.remove()
+                    }
+                    val git = bgGifFrames.keys.iterator()
+                    while (git.hasNext()) {
+                        val gk = git.next()
+                        if (current[gk.substringBefore(':')] !=
+                            gk.substringAfter(':').toLongOrNull()
+                        ) {
+                            git.remove()
+                        }
+                    }
+                    bgGifDelays.keys.retainAll(bgGifFrames.keys)
+                    val pit = bgVideoPoster.keys.iterator()
+                    while (pit.hasNext()) {
+                        val pk = pit.next()
+                        if (current[pk.substringBefore(':')] !=
+                            pk.substringAfter(':').toLongOrNull()
+                        ) {
+                            pit.remove()
+                        }
+                    }
+                }
+                // 磁盘扫尾：缓存目录里不再被当前配置引用的帧包/下载临时文件一律删掉
+                val files = try { ctx.cacheDir.listFiles() } catch (_: Throwable) { null }
+                if (files != null) {
+                    for (f in files) {
+                        val name = f.name
+                        if (name.startsWith("mcf_bg_") && name.endsWith(".zip")) {
+                            val core = name.removePrefix("mcf_bg_").removeSuffix(".zip")
+                            val k = core.substringBeforeLast('_')
+                            val v = core.substringAfterLast('_').toLongOrNull()
+                            if (current[k] != v) {
+                                try { f.delete() } catch (_: Throwable) {}
+                            }
+                        } else if (name.startsWith("mcf_bg_dl_") && name.endsWith(".tmp")) {
+                            val k = name.removePrefix("mcf_bg_dl_").removeSuffix(".tmp")
+                            val inFlight = synchronized(bgLock) { k in bgInFlight }
+                            if (!inFlight) {
+                                try { f.delete() } catch (_: Throwable) {}
+                            }
+                        }
+                    }
+                }
+                lg("bg cleanup done, keep=${current.keys}")
+            } catch (_: Throwable) {}
+        }.start()
     }
 
     /**
@@ -708,6 +1008,7 @@ class MiConnectModule : XposedModule() {
                     lg("config from private cache: enabled=${config.enabled} wl=${config.whitelist.size} bypass_until=${config.bypassUntilMs}")
                 }
             } catch (_: Throwable) {}
+            if (config.bgMap.isNotEmpty()) prewarmBg(app)
             val receiver = object : BroadcastReceiver() {
                 override fun onReceive(ctx: Context?, intent: Intent?) {
                     try {
@@ -736,6 +1037,20 @@ class MiConnectModule : XposedModule() {
                                 )
                             }
                         } catch (_: Throwable) {}
+                        // 配置刚到时弹窗可能已经显示、当时还没背景配置：对最近的弹窗根补一次贴图
+                        if (cfg.bgMap.isNotEmpty()) {
+                            val r = lastBgRoot?.get()
+                            val c = appContext
+                            if (r != null && c != null) {
+                                r.post {
+                                    try {
+                                        decorateRoot(r, lastBgMac, c)
+                                    } catch (_: Throwable) {}
+                                }
+                            }
+                        }
+                        maybeCleanupBg()
+                        if (cfg.bgMap.isNotEmpty()) appContext?.let { prewarmBg(it) }
                     } catch (_: Throwable) {}
                 }
             }
@@ -1701,29 +2016,120 @@ private class VideoBgPlayer(
  * 视频帧包的懒解码帧源：只保存每帧的 JPEG 字节，画到哪帧才解哪帧，
  * 解码结果按 LRU 只留最近 10 帧。弹窗通常只开几秒，没播到的帧永远不解码——省 CPU、省内存。
  */
-private class LazyFrames(val jpegs: List<ByteArray>, val delays: IntArray) {
+private class LazyFrames private constructor(
+    private val zipFile: java.util.zip.ZipFile?,
+    private val entryNames: List<String>,
+    private val memFrames: List<ByteArray>?,
+    val delays: IntArray,
+) {
 
+    constructor(jpegs: List<ByteArray>, delays: IntArray) :
+        this(null, emptyList(), jpegs, delays)
+
+    constructor(zip: java.util.zip.ZipFile, names: List<String>, delays: IntArray) :
+        this(zip, names, null, delays)
+
+    /** 文件后端的 ZIP 文件（替换/清理时用）；内存后端为 null。 */
+    val file: java.io.File? get() = zipFile?.let { java.io.File(it.name) }
+
+    // 后台预解码：播放时主线程只贴图、不再同步解码（原画质帧一张解码几十 ms，
+    // 在主线程解必掉帧）。解码只在显示侧采样到长边 ≤2048，存的文件不动。
+    private val zipLock = Any()
+    private val decodePool = java.util.concurrent.Executors.newFixedThreadPool(3) { r ->
+        Thread(r, "mcf-bg-decode").apply { isDaemon = true }
+    }
+    private val queued: MutableSet<Int> =
+        java.util.Collections.synchronizedSet(HashSet())
+
+    // 解码缓存按像素预算淘汰：原画质帧一张就好几 MB，只按张数算会爆内存
     private val cache = object : java.util.LinkedHashMap<Int, android.graphics.Bitmap>(
         16, 0.75f, true,
     ) {
         override fun removeEldestEntry(
             eldest: MutableMap.MutableEntry<Int, android.graphics.Bitmap>,
-        ): Boolean = size > 10
+        ): Boolean {
+            if (size <= 3) return false
+            var px = 0L
+            for (b in values) px += b.width.toLong() * b.height
+            return px > 24_000_000L
+        }
     }
 
-    val size: Int get() = jpegs.size
+    val size: Int get() = delays.size
 
-    @Synchronized
-    fun frame(i: Int): android.graphics.Bitmap? {
-        cache[i]?.let { return it }
-        val jpg = jpegs.getOrNull(i) ?: return null
-        val bmp = try {
-            BitmapFactory.decodeByteArray(jpg, 0, jpg.size)
+    private fun readJpeg(i: Int): ByteArray? {
+        val zf = zipFile
+        if (zf != null) {
+            synchronized(zipLock) {
+                val e = try { zf.getEntry(entryNames[i]) } catch (_: Throwable) { null }
+                    ?: return null
+                return try {
+                    zf.getInputStream(e).use { it.readBytes() }
+                } catch (_: Throwable) {
+                    null
+                }
+            }
+        }
+        return memFrames?.getOrNull(i)
+    }
+
+    private fun decodeRaw(i: Int): android.graphics.Bitmap? {
+        val jpg = readJpeg(i) ?: return null
+        return try {
+            val bounds = BitmapFactory.Options().apply { inJustDecodeBounds = true }
+            BitmapFactory.decodeByteArray(jpg, 0, jpg.size, bounds)
+            var sample = 1
+            val maxDim = maxOf(bounds.outWidth, bounds.outHeight)
+            while (maxDim / (sample * 2) >= 2048) sample *= 2
+            val opts = BitmapFactory.Options().apply { inSampleSize = sample }
+            BitmapFactory.decodeByteArray(jpg, 0, jpg.size, opts)
         } catch (_: Throwable) {
             null
-        } ?: return null
-        cache[i] = bmp
+        }
+    }
+
+    fun frame(i: Int): android.graphics.Bitmap? {
+        synchronized(this) { cache[i]?.let { return it } }
+        val bmp = decodeRaw(i) ?: return null
+        synchronized(this) { cache[i] = bmp }
         return bmp
+    }
+
+    /** 只取已解码的缓存（不触发解码）：绘制用，未就绪就跳过、绝不卡主线程。 */
+    fun frameCached(i: Int): android.graphics.Bitmap? = synchronized(this) { cache[i] }
+
+    /** 后台预解码后续帧（环形取索引，往返模式在端点附近预取略有偏差，无害）。 */
+    fun prefetch(from: Int) {
+        if (size < 2) return
+        for (k in 1..16) {
+            val idx = (from + k) % size
+            if (idx == from) continue
+            val need = synchronized(this) {
+                !cache.containsKey(idx) && queued.add(idx)
+            }
+            if (!need) continue
+            try {
+                decodePool.execute {
+                    try {
+                        if (frameCached(idx) == null) {
+                            decodeRaw(idx)?.let { bmp ->
+                                synchronized(this) { cache[idx] = bmp }
+                            }
+                        }
+                    } catch (_: Throwable) {
+                    } finally {
+                        queued.remove(idx)
+                    }
+                }
+            } catch (_: Throwable) {
+                queued.remove(idx)
+            }
+        }
+    }
+
+    fun close() {
+        try { decodePool.shutdownNow() } catch (_: Throwable) {}
+        try { zipFile?.close() } catch (_: Throwable) {}
     }
 }
 
@@ -1780,6 +2186,7 @@ private class ClippedBgDrawable(
     private var gifStartStamp = 0L
     private var gifElapsedBase = 0L
     private var gifFrame = 0
+    private var lastLazyBmp: android.graphics.Bitmap? = null
     private val gifTick = object : Runnable {
         override fun run() {
             val tl = gifTimeline ?: return
@@ -1791,15 +2198,18 @@ private class ClippedBgDrawable(
             val idx = tl.frameAt(eff)
             if (idx != gifFrame) {
                 gifFrame = idx
+                try { lazyFrames?.prefetch(idx) } catch (_: Throwable) {}
                 invalidateSelf()
             }
             if (tl.isFinished(eff)) {
+                gifElapsedBase += android.os.SystemClock.uptimeMillis() - gifStartStamp
                 gifPlaying = false
                 gifDone = true
                 return
             }
             val nextEff = tl.nextChangeAt(eff)
             if (nextEff == Long.MAX_VALUE) {
+                gifElapsedBase += android.os.SystemClock.uptimeMillis() - gifStartStamp
                 gifPlaying = false
                 gifDone = true
                 return
@@ -1816,8 +2226,8 @@ private class ClippedBgDrawable(
     fun startIfAnimated() {
         try { animated?.start() } catch (_: Throwable) {}
         try { videoPlayer?.start() } catch (_: Throwable) {}
+        try { lazyFrames?.prefetch(gifFrame) } catch (_: Throwable) {}
         gifWantPlay = true
-        gifDone = false
         startGif()
     }
 
@@ -1830,7 +2240,8 @@ private class ClippedBgDrawable(
     }
 
     private fun startGif() {
-        if (gifTimeline == null || gifPlaying || !gifWantPlay) return
+        // gifDone 守卫：播一次模式播完后，任何迟到的 start 都不许从头重播（「播放两遍」的病根）
+        if (gifTimeline == null || gifPlaying || !gifWantPlay || gifDone) return
         gifPlaying = true
         gifStartStamp = android.os.SystemClock.uptimeMillis()
         gifHandler.removeCallbacks(gifTick)
@@ -1952,7 +2363,10 @@ private class ClippedBgDrawable(
                 canvas.drawBitmap(bmp, src, dstRect, null)
             }
             lazyFrames != null -> {
-                val bmp = lazyFrames.frame(gifFrame.coerceIn(0, lazyFrames.size - 1))
+                val idx = gifFrame.coerceIn(0, lazyFrames.size - 1)
+                val cur = lazyFrames.frameCached(idx)
+                if (cur != null) lastLazyBmp = cur
+                val bmp = cur ?: lastLazyBmp
                 if (bmp != null) {
                     val src = cropRect(bmp.width, bmp.height, b.width(), b.height())
                     dstRect.set(b.left.toFloat(), b.top.toFloat(), b.right.toFloat(), b.bottom.toFloat())
