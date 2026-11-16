@@ -409,6 +409,31 @@ class GifTimeline(delaysMs: IntArray, val mode: Int) {
         return seqFrames[slotAt(pos)]
     }
 
+    /**
+     * 从 effMs 所在段开始，沿播放序列往后取至多 count 个帧序号：
+     * 往返模式逆向段返回递减序号，循环模式绕回开头，播一次模式到末尾停。
+     * 预解码必须按这个方向走，只按帧号往前预取会让往返的逆向段永远等不到帧。
+     */
+    fun upcoming(effMs: Long, count: Int): List<Int> {
+        if (frameCount == 0 || cycleMs <= 0L || seqFrames.isEmpty() || count <= 0) {
+            return emptyList()
+        }
+        if (mode == BgOpt.MODE_ONCE && effMs >= cycleMs) return emptyList()
+        val pos = ((effMs % cycleMs) + cycleMs) % cycleMs
+        var slot = slotAt(pos)
+        val total = seqFrames.size
+        val maxSteps = if (mode == BgOpt.MODE_ONCE) total - slot else total
+        val out = ArrayList<Int>(minOf(count, maxSteps))
+        var steps = 0
+        while (out.size < count && steps < maxSteps) {
+            val f = seqFrames[slot]
+            if (out.isEmpty() || out[out.size - 1] != f) out.add(f)
+            slot = (slot + 1) % total
+            steps++
+        }
+        return out
+    }
+
     /** 有效时间 -> 下一次换帧的有效时间点（ONCE 已结束返回 Long.MAX_VALUE）。 */
     fun nextChangeAt(effMs: Long): Long {
         if (frameCount == 0 || cycleMs <= 0L) return Long.MAX_VALUE

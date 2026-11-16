@@ -561,6 +561,21 @@ class MiConnectModule : XposedModule() {
             val px = boundsOpts.outWidth.toLong() * boundsOpts.outHeight.toLong()
             var delay = 1000 / fps
             var keep = names
+            // 播放端软件解码上限约 30fps：源帧率高于 40fps 时先抽帧降下来，
+            // 不然每帧间隔比解码耗时还短、必然掉帧（延时按倍数补偿，总时长不变）
+            if (fps > 40 && keep.size > 2) {
+                val step = (fps + 29) / 30
+                val next = ArrayList<String>()
+                var i = 0
+                while (i < keep.size) {
+                    next.add(keep[i])
+                    i += step
+                }
+                if (next.size >= 2) {
+                    keep = next
+                    delay *= step
+                }
+            }
             if (px > 0) {
                 while (keep.size > 2 && px * keep.size > 200_000_000L) {
                     val next = ArrayList<String>()
@@ -2049,11 +2064,29 @@ private class LazyFrames private constructor(
     // 后台预解码：播放时主线程只贴图、不再同步解码（原画质帧一张解码几十 ms，
     // 在主线程解必掉帧）。解码只在显示侧采样到长边 ≤2048，存的文件不动。
     private val zipLock = Any()
-    private val decodePool = java.util.concurrent.Executors.newFixedThreadPool(3) { r ->
+    private val decodePool = java.util.concurrent.Executors.newFixedThreadPool(4) { r ->
         Thread(r, "mcf-bg-decode").apply { isDaemon = true }
     }
     private val queued: MutableSet<Int> =
         java.util.Collections.synchronizedSet(HashSet())
+
+    // 缓存像素预算（位图内存约 = 像素 × 4 字节）
+    private val pxBudget = 30_000_000L
+
+    // 一帧的像素数（首帧解出后实测）：预取窗口按 预算/帧像素 定——窗口比缓存能装的
+    // 帧数还大时，还没播到的帧会被先挤出缓存、回头再重解，是掉帧的主因之一
+    @Volatile private var framePx: Long = 0L
+
+    // 当前真正需要的帧集合：解码任务执行时已不在集合里（方向翻转/跳帧）就跳过，
+    // 不让过期帧白占解码线程
+    @Volatile private var wanted: Set<Int> = emptySet()
+
+    /** 预取窗口（不含当前帧）：缓存装得下的帧数留 2 帧余量。 */
+    fun windowSize(): Int {
+        val px = framePx
+        if (px <= 0L) return 10
+        return ((pxBudget / px).toInt() - 2).coerceIn(5, 18)
+    }
 
     // 解码缓存按像素预算淘汰：原画质帧一张就好几 MB，只按张数算会爆内存
     private val cache = object : java.util.LinkedHashMap<Int, android.graphics.Bitmap>(
@@ -2065,7 +2098,7 @@ private class LazyFrames private constructor(
             if (size <= 3) return false
             var px = 0L
             for (b in values) px += b.width.toLong() * b.height
-            return px > 24_000_000L
+            return px > pxBudget
         }
     }
 
@@ -2089,7 +2122,7 @@ private class LazyFrames private constructor(
 
     private fun decodeRaw(i: Int): android.graphics.Bitmap? {
         val jpg = readJpeg(i) ?: return null
-        return try {
+        val bmp = try {
             val bounds = BitmapFactory.Options().apply { inJustDecodeBounds = true }
             BitmapFactory.decodeByteArray(jpg, 0, jpg.size, bounds)
             var sample = 1
@@ -2100,6 +2133,10 @@ private class LazyFrames private constructor(
         } catch (_: Throwable) {
             null
         }
+        if (bmp != null && framePx == 0L) {
+            framePx = bmp.width.toLong() * bmp.height
+        }
+        return bmp
     }
 
     fun frame(i: Int): android.graphics.Bitmap? {
@@ -2112,12 +2149,22 @@ private class LazyFrames private constructor(
     /** 只取已解码的缓存（不触发解码）：绘制用，未就绪就跳过、绝不卡主线程。 */
     fun frameCached(i: Int): android.graphics.Bitmap? = synchronized(this) { cache[i] }
 
-    /** 后台预解码后续帧（环形取索引，往返模式在端点附近预取略有偏差，无害）。 */
+    /** 后台预解码后续帧（按帧号环形往前取；只适合启动预热，播放中要用 prefetchFrames 沿序列预取）。 */
     fun prefetch(from: Int) {
         if (size < 2) return
+        val list = ArrayList<Int>(16)
         for (k in 1..16) {
             val idx = (from + k) % size
-            if (idx == from) continue
+            if (idx != from) list.add(idx)
+        }
+        enqueue(list)
+    }
+
+    private fun enqueue(indices: List<Int>) {
+        if (size < 2) return
+        wanted = indices.toSet()
+        for (idx in indices) {
+            if (idx < 0 || idx >= size) continue
             val need = synchronized(this) {
                 !cache.containsKey(idx) && queued.add(idx)
             }
@@ -2125,7 +2172,7 @@ private class LazyFrames private constructor(
             try {
                 decodePool.execute {
                     try {
-                        if (frameCached(idx) == null) {
+                        if (idx in wanted && frameCached(idx) == null) {
                             decodeRaw(idx)?.let { bmp ->
                                 synchronized(this) { cache[idx] = bmp }
                             }
@@ -2139,6 +2186,11 @@ private class LazyFrames private constructor(
                 queued.remove(idx)
             }
         }
+    }
+
+    /** 按播放序列顺序预解码一组帧（往返逆向段传入的是递减序号）。 */
+    fun prefetchFrames(indices: List<Int>) {
+        enqueue(indices)
     }
 
     fun close() {
@@ -2212,7 +2264,7 @@ private class ClippedBgDrawable(
             val idx = tl.frameAt(eff)
             if (idx != gifFrame) {
                 gifFrame = idx
-                try { lazyFrames?.prefetch(idx) } catch (_: Throwable) {}
+                try { val lf = lazyFrames; lf?.prefetchFrames(tl.upcoming(eff, lf.windowSize() + 1)) } catch (_: Throwable) {}
                 invalidateSelf()
             }
             if (tl.isFinished(eff)) {
@@ -2240,7 +2292,15 @@ private class ClippedBgDrawable(
     fun startIfAnimated() {
         try { animated?.start() } catch (_: Throwable) {}
         try { videoPlayer?.start() } catch (_: Throwable) {}
-        try { lazyFrames?.prefetch(gifFrame) } catch (_: Throwable) {}
+        try {
+            val tl = gifTimeline
+            if (tl != null && lazyFrames != null) {
+                val eff = GifTimeline.effective(gifElapsedBase, opt.speedPct)
+                lazyFrames.prefetchFrames(tl.upcoming(eff, lazyFrames.windowSize() + 1))
+            } else {
+                lazyFrames?.prefetch(gifFrame)
+            }
+        } catch (_: Throwable) {}
         gifWantPlay = true
         startGif()
     }

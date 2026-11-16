@@ -868,6 +868,74 @@ class MainActivity : Activity() {
         return "$s×"
     }
 
+    /** 预览播放用：把 GIF / 视频帧包的全部帧解成位图（采样到长边 ≤1080，预览够用）。 */
+    private fun loadPreviewFrames(
+        isNew: Boolean,
+        editKey: String?,
+    ): Pair<List<android.graphics.Bitmap>?, IntArray?> {
+        val gifBytes: ByteArray? = when {
+            isNew && pendingBgMime == "image/gif" -> pendingBgBytes
+            !isNew && editKey != null && BgStore.isGif(this, editKey) ->
+                try { BgStore.fileFor(this, editKey).readBytes() } catch (_: Throwable) { null }
+            else -> null
+        }
+        if (gifBytes != null) {
+            val decoded = try { GifDecoder.decode(gifBytes) } catch (_: Throwable) { null }
+                ?: return null to null
+            if (decoded.size < 2) return null to null
+            val frames = decoded.map { f ->
+                android.graphics.Bitmap.createBitmap(
+                    f.pixels, f.width, f.height, android.graphics.Bitmap.Config.ARGB_8888,
+                )
+            }
+            return frames to IntArray(decoded.size) { decoded[it].delayMs }
+        }
+        val zip: java.io.File? = when {
+            isNew && pendingBgMime == "video/frames" -> pendingBgFile
+            !isNew && editKey != null && BgStore.isVideo(this, editKey) ->
+                BgStore.fileFor(this, editKey)
+            else -> null
+        }
+        if (zip != null && zip.exists()) {
+            return try {
+                java.util.zip.ZipFile(zip).use { z ->
+                    var fps = 30
+                    z.getEntry("meta.txt")?.let { e ->
+                        val text = z.getInputStream(e).bufferedReader().readText()
+                        Regex("fps=(\\d+)").find(text)?.groupValues?.get(1)?.toIntOrNull()
+                            ?.let { if (it in 1..120) fps = it }
+                    }
+                    val entries = z.entries().asSequence()
+                        .filter { it.name.endsWith(".jpg") }
+                        .sortedBy { it.name }
+                        .toList()
+                    if (entries.size < 2) return null to null
+                    val frames = ArrayList<android.graphics.Bitmap>(entries.size)
+                    for (e in entries) {
+                        val bytes = z.getInputStream(e).use { it.readBytes() }
+                        val bounds = android.graphics.BitmapFactory.Options().apply {
+                            inJustDecodeBounds = true
+                        }
+                        android.graphics.BitmapFactory.decodeByteArray(bytes, 0, bytes.size, bounds)
+                        var sample = 1
+                        val maxDim = maxOf(bounds.outWidth, bounds.outHeight)
+                        while (maxDim / (sample * 2) >= 1080 && sample < 16) sample *= 2
+                        val bmp = android.graphics.BitmapFactory.decodeByteArray(
+                            bytes, 0, bytes.size,
+                            android.graphics.BitmapFactory.Options().apply { inSampleSize = sample },
+                        ) ?: continue
+                        frames.add(bmp)
+                    }
+                    if (frames.size < 2) null to null
+                    else frames to IntArray(frames.size) { 1000 / fps }
+                }
+            } catch (_: Throwable) {
+                null to null
+            }
+        }
+        return null to null
+    }
+
     /**
      * 背景选项面板：导入新图时先过这里（保存后去挑用在哪台设备），
      * 点已有背景行也能再打开改。kind：0=照片 1=GIF/帧包 2=WebP 动图 3=原视频直放。
@@ -919,7 +987,7 @@ class MainActivity : Activity() {
 
         val content = LinearLayout(this).apply { orientation = LinearLayout.VERTICAL }
 
-        // 预览（静态首帧，拖动调区域；设置页不播动图，省电省性能）
+        // 预览（首帧静态显示、拖动调区域；点「播放预览」按当前面板设置播放）
         val preview = ImageView(this).apply {
             scaleType = ImageView.ScaleType.MATRIX
             layoutParams = LinearLayout.LayoutParams(
@@ -937,8 +1005,9 @@ class MainActivity : Activity() {
             clipToOutline = true
             if (firstFrame != null) setImageBitmap(firstFrame)
         }
+        var previewBmp: android.graphics.Bitmap? = firstFrame
         fun updatePreview() {
-            val bmp = firstFrame ?: return
+            val bmp = previewBmp ?: return
             if (preview.width <= 0) {
                 preview.post { updatePreview() }
                 return
@@ -958,7 +1027,7 @@ class MainActivity : Activity() {
         var lastX = 0f
         var lastY = 0f
         preview.setOnTouchListener { v, e ->
-            val bmp = firstFrame
+            val bmp = previewBmp
             when (e.action) {
                 android.view.MotionEvent.ACTION_DOWN -> {
                     lastX = e.x
@@ -987,7 +1056,140 @@ class MainActivity : Activity() {
                 else -> false
             }
         }
+        // ---- 预览播放：按面板当前设置（模式/速度/区域）播，和弹窗里同一条时间轴 ----
+        val playHandler = android.os.Handler(android.os.Looper.getMainLooper())
+        var playFrames: List<android.graphics.Bitmap>? = null
+        var playDelays: IntArray? = null
+        var playTimeline: GifTimeline? = null
+        var playTimelineMode = -1
+        var playEff = 0L
+        var playLastReal = 0L
+        var playRunning = false
+        var playLoading = false
+        var webpAnim: android.graphics.drawable.AnimatedImageDrawable? = null
+        val playBtn = txt("播放预览", 15f, accent).apply {
+            setPadding(dp(4), dp(10), dp(4), dp(2))
+        }
+        fun stopPreviewPlay() {
+            playRunning = false
+            playHandler.removeCallbacksAndMessages(null)
+            try { webpAnim?.stop() } catch (_: Throwable) {}
+            webpAnim = null
+            preview.setImageDrawable(null)
+            previewBmp = firstFrame
+            if (firstFrame != null) preview.setImageBitmap(firstFrame)
+            updatePreview()
+            playBtn.text = "播放预览"
+        }
+        val playTick = object : Runnable {
+            override fun run() {
+                if (!playRunning) return
+                val frames = playFrames ?: return
+                val delays = playDelays ?: return
+                val now = android.os.SystemClock.uptimeMillis()
+                playEff += (now - playLastReal) * cur.speedPct / 100
+                playLastReal = now
+                if (playTimeline == null || playTimelineMode != cur.mode) {
+                    playTimeline = GifTimeline(delays, cur.mode)
+                    playTimelineMode = cur.mode
+                }
+                val tl = playTimeline ?: return
+                val idx = tl.frameAt(playEff)
+                val bmp = frames.getOrNull(idx)
+                if (bmp != null && bmp !== previewBmp) {
+                    previewBmp = bmp
+                    preview.setImageBitmap(bmp)
+                    updatePreview()
+                }
+                if (tl.isFinished(playEff)) {
+                    stopPreviewPlay()
+                    return
+                }
+                val nextEff = tl.nextChangeAt(playEff)
+                if (nextEff == Long.MAX_VALUE) {
+                    stopPreviewPlay()
+                    return
+                }
+                val delayReal = ((nextEff - playEff) * 100 / cur.speedPct).coerceIn(2L, 60_000L) + 1
+                playHandler.postDelayed(this, delayReal)
+            }
+        }
+        fun beginPreviewTick() {
+            playRunning = true
+            playEff = 0L
+            playTimeline = null
+            playTimelineMode = -1
+            playLastReal = android.os.SystemClock.uptimeMillis()
+            playBtn.text = "停止预览"
+            playHandler.removeCallbacks(playTick)
+            playHandler.post(playTick)
+        }
+        fun startPreviewPlay() {
+            if (playLoading) return
+            if (playFrames != null) {
+                beginPreviewTick()
+                return
+            }
+            playLoading = true
+            playBtn.text = "准备中…"
+            val editKey = editKeys?.firstOrNull()
+            Thread {
+                val loaded = loadPreviewFrames(isNew, editKey)
+                runOnUiThread {
+                    playLoading = false
+                    if (loaded.first == null || loaded.second == null) {
+                        playBtn.text = "播放预览"
+                        toast("这个背景没法预览播放")
+                    } else {
+                        playFrames = loaded.first
+                        playDelays = loaded.second
+                        beginPreviewTick()
+                    }
+                }
+            }.start()
+        }
+        fun startWebpPreview() {
+            try {
+                val bytes = if (isNew) {
+                    pendingBgBytes
+                } else {
+                    editKeys?.firstOrNull()?.let {
+                        try { BgStore.fileFor(this@MainActivity, it).readBytes() }
+                        catch (_: Throwable) { null }
+                    }
+                }
+                if (bytes == null) {
+                    toast("这个背景没法预览播放")
+                    return
+                }
+                val d = android.graphics.ImageDecoder.decodeDrawable(
+                    android.graphics.ImageDecoder.createSource(java.nio.ByteBuffer.wrap(bytes)),
+                )
+                if (d is android.graphics.drawable.AnimatedImageDrawable) {
+                    webpAnim = d
+                    preview.setImageDrawable(d)
+                    d.start()
+                    playRunning = true
+                    playBtn.text = "停止预览"
+                } else {
+                    toast("这个背景没法预览播放")
+                }
+            } catch (_: Throwable) {
+                toast("这个背景没法预览播放")
+            }
+        }
+        playBtn.setOnClickListener {
+            when {
+                playRunning -> stopPreviewPlay()
+                kind == 2 -> startWebpPreview()
+                else -> startPreviewPlay()
+            }
+        }
+
         content.addView(preview)
+        if (kind == 1 || kind == 2) {
+            content.addView(playBtn)
+        }
         val zoomVal = txt("${cur.scalePct}%", 13f, accent).apply {
             gravity = android.view.Gravity.END
         }
@@ -1126,7 +1328,9 @@ class MainActivity : Activity() {
                 when (ev.actionMasked) {
                     android.view.MotionEvent.ACTION_DOWN -> {
                         val loc = IntArray(2)
-                        preview.getLocationInWindow(loc)
+                        // 必须用屏幕坐标和 rawX/rawY 比：窗口坐标差了对话框的窗口偏移，
+                        // 之前用 getLocationInWindow 导致命中框整体错位、拖动老被判成滚动
+                        preview.getLocationOnScreen(loc)
                         downInPreview = ev.rawX >= loc[0] && ev.rawX < loc[0] + preview.width &&
                             ev.rawY >= loc[1] && ev.rawY < loc[1] + preview.height
                         if (downInPreview) return false
@@ -1139,7 +1343,7 @@ class MainActivity : Activity() {
             }
         }
         scrollContent.addView(content)
-        MiuixUi.showDialog(
+        val sheetDialog = MiuixUi.showDialog(
             this,
             title = "背景设置",
             content = scrollContent,
@@ -1158,6 +1362,7 @@ class MainActivity : Activity() {
             },
             negativeText = if (!isNew && viaLongPress) "关闭" else "取消",
         )
+        sheetDialog.setOnDismissListener { stopPreviewPlay() }
         scrollContent.post {
             val maxH = (resources.displayMetrics.heightPixels * 0.58f).toInt()
             if (scrollContent.height > maxH) {
