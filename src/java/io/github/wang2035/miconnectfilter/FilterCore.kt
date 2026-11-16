@@ -22,20 +22,133 @@ import java.io.File
  */
 enum class Decision { ALLOW, BLOCK, PASS }
 
+/**
+ * 弹窗背景播放/显示选项（每个背景 key 一份，随配置下发）：
+ * mode：0=循环 1=播一次停在最后一帧 2=往返（正放完倒放）；speedPct：播放速度百分比；
+ * focusX/focusY：显示区域中心（千分比）；scalePct：区域缩放（100=刚好填满卡片，越大越放大）。
+ */
+data class BgOpt(
+    // 默认播一次停在最后一帧（用户 2026-11-16 定），要循环/往返在背景设置里改
+    val mode: Int = 1,
+    val speedPct: Int = 100,
+    val focusX: Int = 500,
+    val focusY: Int = 500,
+    val scalePct: Int = 100,
+) {
+    /** "mode:speed:fx:fy:scale" */
+    fun render(): String = "$mode:$speedPct:$focusX:$focusY:$scalePct"
+
+    companion object {
+        const val MODE_LOOP = 0
+        const val MODE_ONCE = 1
+        const val MODE_PINGPONG = 2
+        val DEFAULT = BgOpt()
+
+        fun parse(text: String?): BgOpt {
+            if (text.isNullOrBlank()) return DEFAULT
+            val p = text.split(':')
+            if (p.size < 5) return DEFAULT
+            return BgOpt(
+                mode = (p[0].toIntOrNull() ?: 1).coerceIn(0, 2),
+                speedPct = (p[1].toIntOrNull() ?: 100).coerceIn(25, 300),
+                focusX = (p[2].toIntOrNull() ?: 500).coerceIn(0, 1000),
+                focusY = (p[3].toIntOrNull() ?: 500).coerceIn(0, 1000),
+                scalePct = (p[4].toIntOrNull() ?: 100).coerceIn(100, 300),
+            )
+        }
+
+        /** "all:<opt>,AABBCC112233:<opt>" <-> 分配表。 */
+        fun parseMap(text: String?): Map<String, BgOpt> {
+            if (text.isNullOrBlank()) return emptyMap()
+            val out = LinkedHashMap<String, BgOpt>()
+            for (part in text.split(',')) {
+                val t = part.trim()
+                if (t.isEmpty()) continue
+                val i = t.indexOf(':')
+                if (i <= 0) continue
+                val key = t.substring(0, i).trim().lowercase()
+                    .takeIf { it == FilterConfig.BG_ALL_KEY || it.matches(Regex("^[0-9a-f]{12}$")) }
+                    ?: continue
+                out[if (key == FilterConfig.BG_ALL_KEY) key else key.uppercase()] =
+                    parse(t.substring(i + 1))
+            }
+            return out
+        }
+
+        fun renderMap(map: Map<String, BgOpt>): String =
+            map.entries.sortedBy { it.key }.joinToString(",") { "${it.key}:${it.value.render()}" }
+    }
+}
+
 data class FilterConfig(
     val enabled: Boolean = true,
     val whitelist: Set<String> = emptySet(),
     val bypassUntilMs: Long = 0L,
     val debug: Boolean = false,
+    /**
+     * 弹窗背景图分配表：key = "all"（全部设备）或设备 MAC 去分隔符大写（如 AABBCC112233），
+     * value = 该图版本号（设置页每次更换/清除递增，hook 据此刷新缓存）。
+     * 弹窗按设备 MAC 先查专属图，没有再用 "all"。
+     */
+    val bgMap: Map<String, Long> = emptyMap(),
+    /** 每张背景图的播放/显示选项（模式/速度/区域），key 同 bgMap。 */
+    val bgOpts: Map<String, BgOpt> = emptyMap(),
+    /** 弹窗字体颜色：0=系统（跟随系统深色/浅色，不改） 1=白字 2=黑字。 */
+    val fontColor: Int = 0,
 ) {
     fun isBypassActive(nowMs: Long): Boolean = bypassUntilMs > nowMs
 
+    /** 某张背景图的选项（没设过用默认：循环、原速、居中填满）。 */
+    fun bgOptFor(key: String): BgOpt = bgOpts[key] ?: BgOpt.DEFAULT
+
+    /** 这台设备的弹窗该用哪张背景图：专属优先，其次全部设备；都没有返回 null。 */
+    fun bgKeyFor(mac: String?): String? = bgKeysFor(mac).firstOrNull()
+
+    /** 候选 key 顺序：专属在前、"all" 兜底。专属图被删/拉不到时 hook 按序回退。 */
+    fun bgKeysFor(mac: String?): List<String> {
+        val out = ArrayList<String>(2)
+        val k = MacUtil.keyOf(mac)
+        if (k != null && bgMap.containsKey(k)) out.add(k)
+        if (bgMap.containsKey(BG_ALL_KEY)) out.add(BG_ALL_KEY)
+        return out
+    }
+
     companion object {
+        const val BG_ALL_KEY = "all"
+        const val FONT_SYSTEM = 0
+        const val FONT_WHITE = 1
+        const val FONT_BLACK = 2
+
+        /** "all:3,AABBCC112233:5" <-> 分配表。 */
+        fun parseBgMap(text: String?): Map<String, Long> {
+            if (text.isNullOrBlank()) return emptyMap()
+            val out = LinkedHashMap<String, Long>()
+            for (part in text.split(',', ';', ' ')) {
+                val p = part.trim()
+                if (p.isEmpty()) continue
+                val i = p.lastIndexOf(':')
+                if (i <= 0) continue
+                val key = p.substring(0, i).trim().lowercase()
+                    .takeIf { it == BG_ALL_KEY || it.matches(Regex("^[0-9a-f]{12}$")) } ?: continue
+                val v = p.substring(i + 1).toLongOrNull() ?: continue
+                if (v > 0) out[if (key == BG_ALL_KEY) key else key.uppercase()] = v
+            }
+            return out
+        }
+
+        fun renderBgMap(map: Map<String, Long>): String =
+            map.entries.filter { it.value > 0 }
+                .sortedBy { it.key }
+                .joinToString(",") { "${it.key}:${it.value}" }
+
         fun parse(text: String): FilterConfig {
             var enabled = true
             var wl: Set<String> = emptySet()
             var bypass = 0L
             var debug = false
+            var bgMap: Map<String, Long> = emptyMap()
+            var bgOpts: Map<String, BgOpt> = emptyMap()
+            var fontColor = 0
             for (raw in text.lineSequence()) {
                 val line = raw.trim()
                 if (line.isEmpty() || line.startsWith("#")) continue
@@ -49,19 +162,30 @@ data class FilterConfig(
                         .mapNotNull { MacUtil.normalize(it) }.toSet()
                     "bypass_until" -> bypass = value.toLongOrNull() ?: 0L
                     "debug" -> debug = (value == "1" || value.equals("true", true))
+                    "bg_map" -> bgMap = parseBgMap(value)
+                    "bg_opts" -> bgOpts = BgOpt.parseMap(value)
+                    "font_color" -> fontColor = (value.toIntOrNull() ?: 0).coerceIn(0, 2)
+                    // v1.21 的单图写法，读到就当「全部设备」
+                    "bg_version" -> {
+                        val v = value.toLongOrNull() ?: 0L
+                        if (v > 0 && bgMap.isEmpty()) bgMap = mapOf(BG_ALL_KEY to v)
+                    }
                 }
             }
-            return FilterConfig(enabled, wl, bypass, debug)
+            return FilterConfig(enabled, wl, bypass, debug, bgMap, bgOpts, fontColor)
         }
 
         /** 广播通道用的构造：入参来自 Intent extras，已在 UI 侧算好。 */
-        fun of(enabled: Boolean, whitelistCsv: String, bypassUntilMs: Long, debug: Boolean): FilterConfig =
+        fun of(enabled: Boolean, whitelistCsv: String, bypassUntilMs: Long, debug: Boolean, bgMapCsv: String = "", bgOptsCsv: String = "", fontColor: Int = 0): FilterConfig =
             FilterConfig(
                 enabled = enabled,
                 whitelist = whitelistCsv.split(',', ';', ' ')
                     .mapNotNull { MacUtil.normalize(it) }.toSet(),
                 bypassUntilMs = bypassUntilMs.coerceAtLeast(0L),
                 debug = debug,
+                bgMap = parseBgMap(bgMapCsv),
+                bgOpts = BgOpt.parseMap(bgOptsCsv),
+                fontColor = fontColor.coerceIn(0, 2),
             )
 
         fun load(file: File): FilterConfig = try {
@@ -70,7 +194,7 @@ data class FilterConfig(
             FilterConfig()
         }
 
-        fun render(enabled: Boolean, whitelist: Set<String>, bypassUntilMs: Long, debug: Boolean): String {
+        fun render(enabled: Boolean, whitelist: Set<String>, bypassUntilMs: Long, debug: Boolean, bgMap: Map<String, Long> = emptyMap(), bgOpts: Map<String, BgOpt> = emptyMap(), fontColor: Int = 0): String {
             val sb = StringBuilder()
             sb.append("# miconnectfilter conf v1\n")
             sb.append("enabled=").append(if (enabled) "1" else "0").append('\n')
@@ -79,6 +203,9 @@ data class FilterConfig(
             ).append('\n')
             sb.append("bypass_until=").append(bypassUntilMs.coerceAtLeast(0L)).append('\n')
             sb.append("debug=").append(if (debug) "1" else "0").append('\n')
+            sb.append("bg_map=").append(renderBgMap(bgMap)).append('\n')
+            sb.append("bg_opts=").append(BgOpt.renderMap(bgOpts)).append('\n')
+            sb.append("font_color=").append(fontColor.coerceIn(0, 2)).append('\n')
             return sb.toString()
         }
     }
@@ -94,11 +221,26 @@ object ConfigBus {
     const val REQUEST_ACTION = "io.github.wang2035.miconnectfilter.action.CONFIG_REQUEST"
     const val TOKEN = "mcf-cfg-v1"
     const val MODULE_PACKAGE = "io.github.wang2035.miconnectfilter"
+
+    /** 弹窗背景图 Provider：hook 进程经 content:// 拉取设置页选好的图片字节（按 key 取图）。 */
+    const val BG_AUTHORITY = "io.github.wang2035.miconnectfilter.bg"
+    fun bgUri(key: String): String = "content://$BG_AUTHORITY/bg/$key"
 }
 
 object MacUtil {
     private val HEX12 = Regex("^[0-9A-F]{12}$")
     private val MAC_IN_TEXT = Regex("(?i)([0-9A-F]{2}[:-]){5}[0-9A-F]{2}")
+
+    /** 背景图分配表的 key：MAC 去分隔符大写（AABBCC112233）；非法返回 null。 */
+    fun keyOf(raw: String?): String? = normalize(raw)?.replace(":", "")
+
+    /** 分配表 key 还原成标准 MAC（"all" 返回 null）。 */
+    fun macOfKey(key: String?): String? {
+        if (key == null || key.length != 12) return null
+        if (!key.all { it.isDigit() || it in 'A'..'F' || it in 'a'..'f' }) return null
+        val u = key.uppercase()
+        return (0 until 6).joinToString(":") { u.substring(it * 2, it * 2 + 2) }
+    }
 
     /** 任意写法的 MAC -> 标准 AA:BB:CC:DD:EE:FF；非法返回 null。 */
     fun normalize(raw: String?): String? {

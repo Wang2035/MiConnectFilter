@@ -1,8 +1,8 @@
 <?xml version="1.0" encoding="utf-8"?>
 <manifest xmlns:android="http://schemas.android.com/apk/res/android"
     package="io.github.wang2035.miconnectfilter"
-    android:versionCode="21"
-    android:versionName="1.20">
+    android:versionCode="34"
+    android:versionName="1.33">
 
     <uses-sdk
         android:minSdkVersion="27"
@@ -28,6 +28,10 @@
         <activity
             android:name=".PairedActivity"
             android:exported="false" />
+        <provider
+            android:name=".BgProvider"
+            android:authorities="io.github.wang2035.miconnectfilter.bg"
+            android:exported="true" />
         <receiver
             android:name=".ConfigRequestReceiver"
             android:exported="true">

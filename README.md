@@ -13,6 +13,8 @@ LSPosed（Zygote）模块，过滤小米耳机「妙享快连」发现弹窗：�
 - **严格执行白名单（默认且写死，无开关）**：弹窗场景下，只要是小米系耳机、不在白名单，不管配没配对都拦截；白名单内照常弹窗。
 - **临时放行**：设置页一键暂停拦截 1 / 3 / 5 分钟（最长 5 分钟），到期自动恢复，方便配对新设备。
 - **名称同步**：读取系统蓝牙别名，在系统里给耳机改过名后，白名单里的名称会自动更新。
+- **弹窗背景**：可给全部设备或某台耳机单独设置弹窗卡片背景，支持照片、动态图（GIF / 动态 WebP）、动态照片与视频（在本应用内按原帧率抽帧后送到弹窗播放）；播放模式（循环 / 播一次停在最后一帧 / 往返）、播放速度、显示区域都可调。
+- **弹窗字体颜色**：系统（跟随系统深色/浅色模式）/ 白字 / 黑字三档，配合背景图保证文字看得清。
 - **诊断日志**：可开关；关着时模块零日志输出。开着时记录每个弹窗事件的进程、入口、设备 MAC、判定与原因，可在设置页查看/清除/导出。
 - **不禁用 MiLink、不停服务、不做全局通知拦截**：只在目标进程内逐条判定带设备信息的弹窗与通知。
 
@@ -53,6 +55,8 @@ Package: `io.github.wang2035.miconnectfilter` (renamed from com.miconnect.filter
 - **Strict whitelist, always on (hard-coded, no toggle)**: in a popup context, any Xiaomi earbud that is not whitelisted gets blocked — paired or not. Whitelisted devices pop up as usual.
 - **Temporary bypass**: pause blocking for 1 / 3 / 5 minutes (5 max) from the settings page to pair a new device; it resumes automatically.
 - **Name sync**: reads the system Bluetooth alias, so renamed earbuds get their new name in the whitelist automatically.
+- **Popup background**: set a card background for all devices or per earbud — photos, animated images (GIF / animated WebP), motion photos and videos (videos are frame-extracted at their native frame rate inside the app, then played in the popup); play mode (loop / once, stop on last frame / ping-pong), speed and crop region are adjustable.
+- **Popup font color**: System (follows the system dark/light mode) / white / black, so text stays readable over a custom background.
 - **Diagnostic logging**: optional; when off, the module emits no logs at all. When on, every popup event is recorded with process, entry point, device MAC, decision and reason, viewable / clearable / exportable in the settings page.
 - **No MiLink disabling, no service killing, no global notification blocking**: decisions are made per popup/notification carrying device info, inside the target processes only.
 

@@ -15,9 +15,28 @@ import io.github.libxposed.api.XposedModuleInterface
 import android.view.View
 import android.view.ViewGroup
 import android.view.WindowManager
+import android.widget.FrameLayout
+import android.widget.ImageView
 import android.widget.TextView
+import android.graphics.BitmapFactory
+import android.graphics.Canvas
+import android.graphics.ColorFilter
+import android.graphics.ImageDecoder
+import android.graphics.Outline
+import android.graphics.Path
+import android.graphics.PixelFormat
+import android.graphics.Rect
+import android.graphics.RectF
+import android.graphics.drawable.AnimatedImageDrawable
+import android.graphics.drawable.BitmapDrawable
+import android.graphics.drawable.ColorDrawable
+import android.graphics.drawable.Drawable
+import android.net.Uri
+import java.io.ByteArrayOutputStream
 import java.io.File
+import java.lang.ref.WeakReference
 import java.lang.reflect.Method
+import java.nio.ByteBuffer
 import java.util.Collections
 import java.util.WeakHashMap
 import java.util.concurrent.ConcurrentHashMap
@@ -80,8 +99,521 @@ class MiConnectModule : XposedModule() {
     private val blockedViews: MutableSet<View> =
         Collections.newSetFromMap(WeakHashMap<View, Boolean>())
 
-    private fun remember(probe: Probe) {
+    // ------------------------------------------------------------ 弹窗背景图
+    // 设置页可给「全部设备」或某台设备单独存一张图，经 BgProvider 暴露为
+    // content://.../bg/<key>；hook 按弹窗设备 MAC 从 config.bgMap 挑 key、
+    // 按版本号拉取字节并缓存。贴图方式是把弹窗卡片的 background 换成按原
+    // 圆角裁剪的图片（OPPO 个性化弹窗同款，图填满卡片内部、内容照常在上层）。
+    // 弹窗有两种载体：Activity（onCreate 层）和独立窗口/Dialog（WindowManager
+    // addView 层）——v1.23 只够到 Activity 的空壳，图全垫在了窗外；两层都接。
+    // 拉不到/解码失败一律静默放弃，绝不影响弹窗本身。
+
+    private val bgLock = Any()
+    private val bgCache = HashMap<String, ByteArray>()
+    private val bgCacheVer = HashMap<String, Long>()
+    private val bgMissing = HashSet<String>()
+    private val bgInFlight = HashSet<String>()
+    /** GIF 帧缓存："key:ver" -> 帧位图/帧时长（拉取线程里解好，贴图时直接用）。 */
+    private val bgGifFrames = HashMap<String, List<android.graphics.Bitmap>>()
+    private val bgVideoPoster = HashMap<String, android.graphics.Bitmap>()
+    private val bgGifDelays = HashMap<String, IntArray>()
+    /** 视频帧包缓存："key:ver" -> 懒解码帧源（只存 JPEG 字节，画到哪帧解哪帧，省 CPU/内存）。 */
+    private val bgLazyFrames = HashMap<String, LazyFrames>()
+    @Volatile private var pendingBgRoot: WeakReference<View>? = null
+    @Volatile private var pendingBgMac: String? = null
+    @Volatile private var pendingBgCtx: Context? = null
+    /** 已贴好背景的窗口根 -> "key:ver"，防重复贴、版本变了重贴。 */
+    private val bgRootTokens: MutableMap<View, String> =
+        Collections.synchronizedMap(WeakHashMap())
+
+    private fun applyPopupBackground(activity: Activity, mac: String?) {
         try {
+            val root = activity.window?.decorView ?: return
+            decorateRoot(root, mac, activity.applicationContext)
+            applyFontColor(root)
+        } catch (_: Throwable) {}
+    }
+
+    // ------------------------------------------------------------ 弹窗字体颜色
+    // 设置项 fontColor：0=系统（不改，弹窗自己跟随深色/浅色） 1=白字 2=黑字。
+    // 只改 TextView 的文字/提示色，不动图标与背景；弹窗内容常在窗口加上后才
+    // 填充，每个根再补三次延时重刷兜底。系统模式不进这里，零干预。
+
+    private val fontAppliedRoots: MutableMap<View, Int> =
+        Collections.synchronizedMap(WeakHashMap())
+
+    private fun applyFontColor(root: View) {
+        val mode = config.fontColor
+        if (mode != FilterConfig.FONT_WHITE && mode != FilterConfig.FONT_BLACK) return
+        val color = if (mode == FilterConfig.FONT_WHITE) {
+            android.graphics.Color.WHITE
+        } else {
+            android.graphics.Color.BLACK
+        }
+        try {
+            setTextColors(root, color)
+            val prev = synchronized(fontAppliedRoots) { fontAppliedRoots.put(root, mode) }
+            if (prev != mode) {
+                val handler = android.os.Handler(android.os.Looper.getMainLooper())
+                for (delay in longArrayOf(250L, 700L, 1500L)) {
+                    handler.postDelayed(
+                        { try { setTextColors(root, color) } catch (_: Throwable) {} },
+                        delay,
+                    )
+                }
+            }
+        } catch (_: Throwable) {}
+    }
+
+    private fun setTextColors(view: View, color: Int) {
+        if (view is android.widget.TextView) {
+            try { view.setTextColor(color) } catch (_: Throwable) {}
+            try { view.setHintTextColor(color) } catch (_: Throwable) {}
+        }
+        if (view is android.view.ViewGroup) {
+            for (i in 0 until view.childCount) {
+                try { setTextColors(view.getChildAt(i), color) } catch (_: Throwable) {}
+            }
+        }
+    }
+
+    private fun decorateRoot(root: View, mac: String?, appCtx: Context) {
+        try {
+            // 候选按序尝试：专属图拉不到（已删/拉取失败）就回退「全部设备」图，
+            // 不再像旧版那样卡在失效的专属 key 上、把 all 也挡死。
+            for (key in config.bgKeysFor(mac)) {
+                val ver = config.bgMap[key] ?: continue
+                if (ver <= 0L) continue
+                val ready = synchronized(bgLock) {
+                    if (bgCacheVer[key] == ver && key !in bgMissing) bgCache[key] else null
+                }
+                if (ready != null) {
+                    decorateWithBytes(root, ready, key, ver, 0)
+                    return
+                }
+                val knownMissing = synchronized(bgLock) {
+                    key in bgMissing && bgCacheVer[key] == ver
+                }
+                if (knownMissing) continue
+                pendingBgRoot = WeakReference(root)
+                pendingBgMac = mac
+                pendingBgCtx = appCtx
+                fetchBgBytes(appCtx, key, ver)
+                return
+            }
+        } catch (_: Throwable) {}
+    }
+
+    private fun fetchBgBytes(ctx: Context, key: String, version: Long) {
+        synchronized(bgLock) {
+            if (!bgInFlight.add(key)) return
+        }
+        Thread {
+            try {
+                val bytes = ctx.contentResolver.openInputStream(Uri.parse(ConfigBus.bgUri(key)))?.use { ins ->
+                    val buf = ByteArrayOutputStream()
+                    val tmp = ByteArray(64 * 1024)
+                    var total = 0
+                    while (true) {
+                        val n = ins.read(tmp)
+                        if (n <= 0) break
+                        total += n
+                        if (total > 24 * 1024 * 1024) break
+                        buf.write(tmp, 0, n)
+                    }
+                    buf.toByteArray()
+                }
+                synchronized(bgLock) {
+                    if (bytes != null && bytes.isNotEmpty()) {
+                        bgCache[key] = bytes
+                        bgMissing.remove(key)
+                    } else {
+                        bgCache.remove(key)
+                        bgMissing.add(key)
+                    }
+                    bgCacheVer[key] = version
+                }
+                // 原视频：先抓一张海报帧兜底（解码器出帧前先有图可画，解码失败也不空）
+                if (bytes != null && bytes.size >= 8 &&
+                    bytes.copyOfRange(4, 8).toString(Charsets.US_ASCII) == "ftyp"
+                ) {
+                    try {
+                        val r = android.media.MediaMetadataRetriever()
+                        try {
+                            r.setDataSource(mediaDataSourceFor(bytes))
+                            val rot = r.extractMetadata(
+                                android.media.MediaMetadataRetriever.METADATA_KEY_VIDEO_ROTATION,
+                            )?.toIntOrNull() ?: 0
+                            var poster = r.getFrameAtTime(
+                                0L, android.media.MediaMetadataRetriever.OPTION_CLOSEST,
+                            )
+                            if (poster != null && rot != 0) {
+                                val m = android.graphics.Matrix().apply {
+                                    postRotate(rot.toFloat())
+                                }
+                                poster = android.graphics.Bitmap.createBitmap(
+                                    poster, 0, 0, poster.width, poster.height, m, true,
+                                )
+                            }
+                            if (poster != null) {
+                                synchronized(bgLock) {
+                                    bgVideoPoster["$key:$version"] = poster
+                                }
+                                lg("bg video poster key=$key ${poster.width}x${poster.height}")
+                            }
+                        } finally {
+                            try { r.release() } catch (_: Throwable) {}
+                        }
+                    } catch (t: Throwable) {
+                        lg("bg video poster failed key=$key: ${t.message}")
+                    }
+                }
+                // GIF 在拉取线程里先解成帧（自有播放器要逐帧控制模式/速度），
+                // 别等到贴图时在主线程解码卡弹窗。
+                if (bytes != null && GifDecoder.isGif(bytes)) {
+                    try {
+                        val frames = GifDecoder.thinFrames(
+                            GifDecoder.decode(bytes), 150_000_000L,
+                        )
+                        if (frames.size >= 2) {
+                            val bitmaps = frames.map { f ->
+                                android.graphics.Bitmap.createBitmap(
+                                    f.pixels, f.width, f.height,
+                                    android.graphics.Bitmap.Config.ARGB_8888,
+                                )
+                            }
+                            synchronized(bgLock) {
+                                bgGifFrames["$key:$version"] = bitmaps
+                                bgGifDelays["$key:$version"] =
+                                    IntArray(frames.size) { frames[it].delayMs }
+                            }
+                            log("BGGIF", null, "key=$key frames=${frames.size} pkg=$targetPackage")
+                            lg("bg gif decoded key=$key frames=${frames.size}")
+                        }
+                    } catch (t: Throwable) {
+                        lg("bg gif decode failed key=$key: ${t.message}")
+                    }
+                }
+                // 视频帧包（ZIP）：只拆包不解码，帧源懒解码（画到才解），弹窗打开快、平时不耗电
+                if (bytes != null && bytes.size >= 2 &&
+                    bytes[0] == 0x50.toByte() && bytes[1] == 0x4B.toByte()
+                ) {
+                    val parsed = parseBundle(bytes)
+                    if (parsed != null) {
+                        synchronized(bgLock) {
+                            bgLazyFrames["$key:$version"] = parsed
+                        }
+                        lg("bg video frames parsed key=$key frames=${parsed.size}")
+                    }
+                }
+                lg("bg fetched key=$key version=$version bytes=${bytes?.size ?: -1} pkg=$targetPackage")
+                val root = pendingBgRoot?.get()
+                val c = pendingBgCtx
+                if (root != null && c != null) decorateRoot(root, pendingBgMac, c)
+            } catch (t: Throwable) {
+                synchronized(bgLock) {
+                    bgCache.remove(key)
+                    bgMissing.add(key)
+                    bgCacheVer[key] = version
+                }
+                lg("bg fetch failed key=$key version=$version pkg=$targetPackage: ${t.message}")
+            } finally {
+                synchronized(bgLock) { bgInFlight.remove(key) }
+            }
+        }.start()
+    }
+
+    /** 贴图内容：静态位图 / 系统动图（WebP 用）/ GIF 帧 / 视频懒帧 / 视频直放，五选一。 */
+    private class BgContent(
+        val bitmap: android.graphics.Bitmap? = null,
+        val animated: AnimatedImageDrawable? = null,
+        val gifBitmaps: List<android.graphics.Bitmap>? = null,
+        val gifDelays: IntArray? = null,
+        val lazy: LazyFrames? = null,
+        val videoBytes: ByteArray? = null,
+    ) {
+        val kind: String
+            get() = when {
+                gifBitmaps != null -> "frames(${gifBitmaps.size}f)"
+                lazy != null -> "frames(${lazy.size}f)"
+                videoBytes != null -> "video"
+                animated != null -> "anim"
+                else -> "static"
+            }
+    }
+
+    /**
+     * 视频帧包（ZIP：meta.txt 记 fps，fNNN.jpg 为帧）拆包成懒帧源：只留 JPEG 字节不解码。
+     * 总像素预算靠第一帧的尺寸估算（只读 JPEG 头），超了就抽帧、帧时长加倍补偿。
+     */
+    private fun parseBundle(bytes: ByteArray): LazyFrames? {
+        return try {
+            var fps = 10
+            val entries = ArrayList<Pair<String, ByteArray>>()
+            java.util.zip.ZipInputStream(java.io.ByteArrayInputStream(bytes)).use { z ->
+                while (true) {
+                    val e = z.nextEntry ?: break
+                    val data = z.readBytes()
+                    if (e.name == "meta.txt") {
+                        val m = Regex("fps=(\\d+)").find(data.toString(Charsets.US_ASCII))
+                        fps = m?.groupValues?.get(1)?.toIntOrNull()?.coerceIn(1, 120) ?: 10
+                    } else if (e.name.endsWith(".jpg")) {
+                        entries.add(e.name to data)
+                    }
+                    z.closeEntry()
+                }
+            }
+            entries.sortBy { it.first }
+            if (entries.size < 2) return null
+            var jpegs: List<ByteArray> = entries.map { it.second }
+            val boundsOpts = BitmapFactory.Options().apply { inJustDecodeBounds = true }
+            BitmapFactory.decodeByteArray(jpegs[0], 0, jpegs[0].size, boundsOpts)
+            val px = boundsOpts.outWidth.toLong() * boundsOpts.outHeight.toLong()
+            var delay = 1000 / fps
+            if (px > 0) {
+                while (jpegs.size > 2 && px * jpegs.size > 200_000_000L) {
+                    val next = ArrayList<ByteArray>()
+                    var i = 0
+                    while (i < jpegs.size) {
+                        next.add(jpegs[i])
+                        i += 2
+                    }
+                    jpegs = next
+                    delay *= 2
+                }
+            }
+            LazyFrames(jpegs, IntArray(jpegs.size) { delay })
+        } catch (_: Throwable) {
+            null
+        }
+    }
+
+    private fun buildBgContent(bytes: ByteArray, key: String, version: Long): BgContent? {
+        // 帧缓存优先：GIF 在拉取线程里解好了帧；视频帧包是懒帧源（拆包即得）
+        val (cachedBitmaps, cachedDelays) = synchronized(bgLock) {
+            bgGifFrames["$key:$version"] to bgGifDelays["$key:$version"]
+        }
+        if (cachedBitmaps != null && cachedDelays != null && cachedBitmaps.size >= 2) {
+            return BgContent(gifBitmaps = cachedBitmaps, gifDelays = cachedDelays)
+        }
+        val lazy = synchronized(bgLock) { bgLazyFrames["$key:$version"] }
+        if (lazy != null && lazy.size >= 2) {
+            return BgContent(lazy = lazy)
+        }
+        // 原视频（MP4 容器）：直播放器边解边画，原帧率；海报帧作兜底静态图
+        if (bytes.size >= 8 &&
+            bytes.copyOfRange(4, 8).toString(Charsets.US_ASCII) == "ftyp"
+        ) {
+            val poster = synchronized(bgLock) { bgVideoPoster["$key:$version"] }
+            return BgContent(bitmap = poster, videoBytes = bytes)
+        }
+        if (GifDecoder.isGif(bytes)) {
+            // 只有 1 帧或解码没跟上：当静态图用第一帧
+            return try {
+                BitmapFactory.decodeByteArray(bytes, 0, bytes.size)?.let { BgContent(bitmap = it) }
+            } catch (_: Throwable) {
+                null
+            }
+        }
+        if (Build.VERSION.SDK_INT >= 28) {
+            try {
+                val d = ImageDecoder.decodeDrawable(ImageDecoder.createSource(ByteBuffer.wrap(bytes)))
+                if (d is AnimatedImageDrawable) {
+                    // WebP 等系统动图：播一次停靠 repeatCount，其余模式退化为循环
+                    try {
+                        d.repeatCount = if (config.bgOptFor(key).mode == BgOpt.MODE_ONCE) {
+                            0
+                        } else {
+                            AnimatedImageDrawable.REPEAT_INFINITE
+                        }
+                    } catch (_: Throwable) {}
+                    return BgContent(animated = d)
+                }
+                if (d is BitmapDrawable) return BgContent(bitmap = d.bitmap)
+            } catch (_: Throwable) {}
+        }
+        return try {
+            BitmapFactory.decodeByteArray(bytes, 0, bytes.size)?.let { BgContent(bitmap = it) }
+        } catch (_: Throwable) {
+            null
+        }
+    }
+
+    /**
+     * 把图片贴进窗口里的卡片。窗口刚建时尺寸还没量出来、内容可能还没塞完，
+     * 所以带重试多试几次（0/200/400/800ms）。
+     */
+    private fun decorateWithBytes(root: View, bytes: ByteArray, key: String, version: Long, attempt: Int) {
+        root.post {
+            try {
+                if (config.bgMap[key] != version) return@post
+                val token = "$key:$version"
+                if (bgRootTokens[root] == token) {
+                    // 已贴好：重试轮次顺手把卡片背景里的动图再 start 一次，防首次启动时机不对
+                    restartCardBg(root)
+                } else {
+                    val card = findCardIn(root)
+                    if (card != null) {
+                        val content = buildBgContent(bytes, key, version)
+                        if (content != null && applyToCard(card, content, key)) {
+                            bgRootTokens[root] = token
+                            log(
+                                "BGAPPLY", null,
+                                "key=$key kind=${content.kind} bytes=${bytes.size} pkg=$targetPackage",
+                            )
+                            lg(
+                                "bg applied card=${card.javaClass.name} ${card.width}x${card.height} " +
+                                    "key=$key bytes=${bytes.size} attempt=$attempt kind=${content.kind}",
+                            )
+                            if (config.debug) dumpHierarchy(root)
+                        }
+                    } else if (attempt >= 3) {
+                        // 找不到卡片就放弃（旧版垫整窗兜底会糊满屏，已删）
+                        lg("bg: no card found in window root=${root.javaClass.simpleName}")
+                        if (config.debug) dumpHierarchy(root)
+                    }
+                }
+            } catch (_: Throwable) {}
+        }
+        if (attempt < 3) {
+            root.postDelayed(
+                { decorateWithBytes(root, bytes, key, version, attempt + 1) },
+                when (attempt) {
+                    0 -> 200L
+                    1 -> 400L
+                    else -> 800L
+                },
+            )
+        }
+    }
+
+    /**
+     * 找卡片：不再要求自带背景（v1.23 就栽在这——卡片可能没背景、或弹窗根本
+     * 不在 Activity 里）。规则：宽 ≥ 窗口一半、高在窗口 15%~92% 之间的大块
+     * 可见视图里，自带背景的权重最高、容器次之，按面积挑最大。
+     */
+    private fun findCardIn(root: View): View? {
+        val rw = root.width
+        val rh = root.height
+        if (rw <= 0 || rh <= 0) return null
+        var best: View? = null
+        var bestScore = 0L
+        fun walk(v: View, depth: Int) {
+            if (depth > 12) return
+            try {
+                if (v !== root && v.visibility == View.VISIBLE) {
+                    val w = v.width
+                    val h = v.height
+                    if (w >= rw * 0.5 && h >= rh * 0.15 && h <= rh * 0.92) {
+                        var score = w.toLong() * h.toLong()
+                        if (v.background != null) score *= 3
+                        if (v is ViewGroup) score = score * 6 / 5
+                        if (score > bestScore) {
+                            bestScore = score
+                            best = v
+                        }
+                    }
+                }
+                if (v is ViewGroup) {
+                    var i = 0
+                    while (i < v.childCount) {
+                        walk(v.getChildAt(i), depth + 1)
+                        i++
+                    }
+                }
+            } catch (_: Throwable) {}
+        }
+        walk(root, 0)
+        return best
+    }
+
+    /**
+     * 贴到卡片上：直接把卡片的 background 换成按原圆角裁剪的图片 Drawable。
+     * 背景永远画在内容之下，不碰布局——v1.25 用「插入 MATCH_PARENT 图片层」
+     * 贴图，卡片若是纵向 LinearLayout 会把耳机图/电量行全挤出画面，已废弃。
+     */
+    private fun applyToCard(card: View, content: BgContent, key: String): Boolean {
+        return try {
+            (card.background as? ClippedBgDrawable)?.release()
+            val bg = ClippedBgDrawable(
+                bitmap = content.bitmap,
+                animated = content.animated,
+                gifBitmaps = content.gifBitmaps,
+                gifDelays = content.gifDelays,
+                lazyFrames = content.lazy,
+                videoBytes = content.videoBytes,
+                opt = config.bgOptFor(key),
+                radii = cardRadii(card),
+                bgLog = { msg ->
+                    lg("bgvid key=$key $msg")
+                    log("BGVID", null, "key=$key $msg")
+                },
+            )
+            card.background = bg
+            bg.startIfAnimated()
+            true
+        } catch (_: Throwable) {
+            false
+        }
+    }
+
+    /** 已贴卡片背景里的动图再 start 一次（首次 start 时机不对会停在第一帧）。 */
+    private fun restartCardBg(root: View) {
+        try {
+            val card = findCardIn(root) ?: return
+            (card.background as? ClippedBgDrawable)?.startIfAnimated()
+        } catch (_: Throwable) {}
+    }
+
+    /** 卡片圆角：优先读原背景 GradientDrawable 的逐角半径，其次视图轮廓，最后全 0（直角）。 */
+    private fun cardRadii(card: View): FloatArray {
+        try {
+            val bgd = card.background
+            if (bgd is android.graphics.drawable.GradientDrawable) {
+                val r = try { bgd.cornerRadii } catch (_: Throwable) { null }
+                if (r != null && r.size == 8) return r.clone()
+                val u = try { bgd.cornerRadius } catch (_: Throwable) { 0f }
+                if (u > 0f) return FloatArray(8) { u }
+            }
+            val outline = android.graphics.Outline()
+            card.outlineProvider?.getOutline(card, outline)
+            if (outline.radius > 0f) return FloatArray(8) { outline.radius }
+        } catch (_: Throwable) {}
+        return FloatArray(8) { 0f }
+    }
+
+    /** debug 时把窗口视图层级打进日志，供背景不显形时对着结构再适配。 */
+    private fun dumpHierarchy(root: View) {
+        try {
+            val sb = StringBuilder("bg hierarchy root=${root.javaClass.simpleName}:")
+            fun walk(v: View, d: Int) {
+                if (sb.length > 1800) return
+                sb.append('\n').append("  ".repeat(d)).append(v.javaClass.simpleName)
+                    .append(' ').append(v.width).append('x').append(v.height)
+                    .append(" bg=").append(v.background?.javaClass?.simpleName ?: "null")
+                if (v is ViewGroup) {
+                    var i = 0
+                    while (i < v.childCount && i < 12) {
+                        walk(v.getChildAt(i), d + 1)
+                        i++
+                    }
+                }
+            }
+            walk(root, 0)
+            lg(sb.toString())
+        } catch (_: Throwable) {}
+    }
+
+    /** 最近一次带 MAC 的设备探测（窗口文字认不出改名耳机时，给背景挑图兜底）。 */
+    private fun latestRecentMac(maxAgeMs: Long): String? {
+        val now = System.currentTimeMillis()
+        return recent.values
+            .filter { it.mac != null && now - it.at <= maxAgeMs }
+            .maxByOrNull { it.at }
+            ?.mac
+    }
+
+    private fun remember(probe: Probe) {        try {
             val key = probe.mac ?: probe.deviceName?.lowercase() ?: return
             recent[key] = Recent(probe.mac, probe.deviceName, probe.bonded, System.currentTimeMillis())
             val now = System.currentTimeMillis()
@@ -186,6 +718,9 @@ class MiConnectModule : XposedModule() {
                             whitelistCsv = intent.getStringExtra("whitelist") ?: "",
                             bypassUntilMs = intent.getLongExtra("bypass_until", 0L),
                             debug = intent.getBooleanExtra("debug", false),
+                            bgMapCsv = intent.getStringExtra("bg_map") ?: "",
+                            bgOptsCsv = intent.getStringExtra("bg_opts") ?: "",
+                            fontColor = intent.getIntExtra("font_color", 0),
                         )
                         busConfig = cfg
                         config = cfg
@@ -197,7 +732,7 @@ class MiConnectModule : XposedModule() {
                             val ctx = appContext
                             if (ctx != null) {
                                 File(ctx.filesDir, "miconnectfilter.conf").writeText(
-                                    FilterConfig.render(cfg.enabled, cfg.whitelist, cfg.bypassUntilMs, cfg.debug),
+                                    FilterConfig.render(cfg.enabled, cfg.whitelist, cfg.bypassUntilMs, cfg.debug, cfg.bgMap, cfg.bgOpts, cfg.fontColor),
                                 )
                             }
                         } catch (_: Throwable) {}
@@ -414,6 +949,9 @@ class MiConnectModule : XposedModule() {
                                     if (decide(probe, "onCreate:${activity.localClassName}") == Decision.BLOCK) {
                                         lg("finish popup activity ${activity.localClassName}")
                                         try { activity.finish() } catch (_: Throwable) {}
+                                    } else {
+                                        // 弹窗被放行（自家耳机）：按这台设备挑背景图贴进卡片
+                                        applyPopupBackground(activity, probe.mac)
                                     }
                                 } else if (config.debug && (probe.mac != null || probe.deviceName != null)) {
                                     lg("activity pass ${activity.localClassName} mac=${probe.mac} name=${probe.deviceName}")
@@ -472,15 +1010,29 @@ class MiConnectModule : XposedModule() {
                                 joined.contains("airdots") || joined.contains("flipbuds") ||
                                 joined.contains("xiaomi") || joined.contains("redmi") ||
                                 joined.contains("poco") || joined.contains("耳机") ||
+                                joined.contains("左耳") || joined.contains("右耳") ||
                                 MacUtil.extractMacs(joined).isNotEmpty()
+                            val probe = enrichWithRecent(DeviceProbe.fromTexts(texts))
                             if (earbudish) {
-                                val probe = enrichWithRecent(DeviceProbe.fromTexts(texts))
                                 if (decide(probe, "window:addView") == Decision.BLOCK) {
                                     val args = chain.args.toTypedArray()
                                     shrinkParams(args)
                                     synchronized(blockedViews) { blockedViews.add(view) }
                                     lg("window hidden mac=${probe.mac} name=${probe.deviceName}")
                                     return chain.proceed(args)
+                                }
+                                // 放行的耳机窗口：弹窗若是独立窗口/Dialog，Activity 层
+                                // 够不到，就在这里给这个窗口的卡片贴背景
+                                decorateRoot(view, probe.mac, view.context.applicationContext)
+                                applyFontColor(view)
+                            } else if (config.bgMap.isNotEmpty() || config.fontColor != FilterConfig.FONT_SYSTEM) {
+                                // 改过名的耳机（如改成玩笑名）文字里没有任何耳机关键词，
+                                // 窗口层此前直接放行、背景永远贴不上。用最近一次弹窗探测
+                                // 的 MAC 兜底，只贴背景不参与拦截判定。
+                                val macHint = probe.mac ?: latestRecentMac(15_000L)
+                                if (macHint != null || config.bgMap.containsKey(FilterConfig.BG_ALL_KEY)) {
+                                    decorateRoot(view, macHint, view.context.applicationContext)
+                                    applyFontColor(view)
                                 }
                             }
                         }
@@ -723,5 +1275,724 @@ class MiConnectModule : XposedModule() {
                 log("SCAN", null, "pkg=$pkg classes=${names.size} hooked=$hooked")
             } catch (_: Throwable) {}
         }.start()
+    }
+}
+
+/**
+ * 弹窗卡片背景：把图片按「显示区域」选项（缩放 + 焦点）裁剪后画满卡片，
+ * 并按卡片原来的逐角圆角裁剪。内容三种：
+ * - 静态图：直接画 Bitmap；
+ * - GIF：自解码帧 + 自有播放时钟（GifTimeline 管循环/播一次停/往返，
+ *   速度按 speedPct 折算），不依赖系统动图Drawable的回调机制；
+ * - WebP 等系统动图：AnimatedImageDrawable 作内层，回调标准转发。
+ * 作卡片 background 使用，天然画在内容之下。
+ */
+/** 内存字节喂给 MediaExtractor / MediaMetadataRetriever 的随机访问数据源。 */
+private fun mediaDataSourceFor(bytes: ByteArray): android.media.MediaDataSource =
+    object : android.media.MediaDataSource() {
+        override fun readAt(position: Long, buffer: ByteArray, offset: Int, size: Int): Int {
+            if (position >= bytes.size) return -1
+            val n = minOf(size.toLong(), bytes.size - position).toInt()
+            System.arraycopy(bytes, position.toInt(), buffer, offset, n)
+            return n
+        }
+
+        override fun getSize(): Long = bytes.size.toLong()
+
+        override fun close() {}
+    }
+
+/**
+ * 视频直播放器：MP4 字节常驻内存，MediaExtractor + MediaCodec（缓冲模式、无 Surface）
+ * 按原视频时间戳逐帧解出 Bitmap，原帧率播放。模式：循环（放完回跳重解）/ 播一次停
+ * （停在最后一帧）/ 往返（正放时缓存帧，放完用缓存倒放、正放，无限往返；缓存超限
+ * 退化为循环）。速度按 speedPct 缩放时钟。不可见即暂停（时钟冻结）；暂停超 90 秒
+ * 线程自退，防弹窗关掉后在蓝牙进程里空转。
+ */
+private class VideoBgPlayer(
+    private val bytes: ByteArray,
+    private val opt: BgOpt,
+    private val onFrame: (android.graphics.Bitmap) -> Unit,
+    private val onError: (String) -> Unit,
+    private val onEvent: (String) -> Unit = {},
+) {
+
+    @Volatile private var released = false
+    @Volatile private var wantPlay = false
+    @Volatile private var thread: Thread? = null
+    @Volatile private var current: android.graphics.Bitmap? = null
+
+    fun currentFrame(): android.graphics.Bitmap? = current
+
+    fun start() {
+        wantPlay = true
+        synchronized(this) {
+            if (!released && thread?.isAlive != true) {
+                thread = Thread({ runLoop() }, "mcf-bg-video").apply {
+                    isDaemon = true
+                    start()
+                }
+            }
+        }
+    }
+
+    fun pause() {
+        wantPlay = false
+    }
+
+    fun release() {
+        released = true
+        wantPlay = false
+    }
+
+    /** 播放时钟：位置（µs）随真实时间 × 速度推进，暂停冻结。只在解码线程里操作。 */
+    private class Clock(private val speedPct: Int) {
+        private var basePosUs = 0L
+        private var baseStamp = 0L
+        private var running = false
+
+        fun restart() {
+            basePosUs = 0L
+            baseStamp = android.os.SystemClock.uptimeMillis()
+            running = true
+        }
+
+        fun pos(): Long =
+            if (running) {
+                basePosUs + (android.os.SystemClock.uptimeMillis() - baseStamp) * 10L * speedPct
+            } else {
+                basePosUs
+            }
+
+        fun pause() {
+            if (running) {
+                basePosUs = pos()
+                running = false
+            }
+        }
+
+        fun resume() {
+            if (!running) {
+                baseStamp = android.os.SystemClock.uptimeMillis()
+                running = true
+            }
+        }
+    }
+
+    /** 等时钟走到 posUs；暂停时冻结等待，释放或暂停超时（90 秒）返回 false。 */
+    private fun waitUntil(clock: Clock, posUs: Long): Boolean {
+        var pausedSince = 0L
+        while (!released) {
+            if (!wantPlay) {
+                clock.pause()
+                val now = android.os.SystemClock.uptimeMillis()
+                if (pausedSince == 0L) pausedSince = now
+                if (now - pausedSince > 90_000L) return false
+                try {
+                    Thread.sleep(30)
+                } catch (_: InterruptedException) {
+                    return false
+                }
+                continue
+            }
+            pausedSince = 0L
+            clock.resume()
+            val remainMs = (posUs - clock.pos()) / 1000L
+            if (remainMs <= 0) return true
+            try {
+                Thread.sleep(minOf(remainMs, 20L).coerceAtLeast(1L))
+            } catch (_: InterruptedException) {
+                return false
+            }
+        }
+        return false
+    }
+
+    private fun runLoop() {
+        val extractor = android.media.MediaExtractor()
+        var codec: android.media.MediaCodec? = null
+        try {
+            extractor.setDataSource(mediaDataSourceFor(bytes))
+            var mime = ""
+            var format: android.media.MediaFormat? = null
+            for (i in 0 until extractor.trackCount) {
+                val f = extractor.getTrackFormat(i)
+                val m = f.getString(android.media.MediaFormat.KEY_MIME) ?: continue
+                if (m.startsWith("video/")) {
+                    extractor.selectTrack(i)
+                    mime = m
+                    format = f
+                    break
+                }
+            }
+            val fmt = format ?: run {
+                onError("no video track")
+                return
+            }
+            val rotation = try {
+                fmt.getInteger(android.media.MediaFormat.KEY_ROTATION)
+            } catch (_: Throwable) {
+                0
+            }
+            // 只取解码必需字段建新 format：抽取器给的 format 带厂商私有项，
+            // 个别机型 configure 会因此失败，净化掉
+            val clean = android.media.MediaFormat()
+            clean.setString(android.media.MediaFormat.KEY_MIME, mime)
+            try {
+                clean.setInteger(
+                    android.media.MediaFormat.KEY_WIDTH,
+                    fmt.getInteger(android.media.MediaFormat.KEY_WIDTH),
+                )
+                clean.setInteger(
+                    android.media.MediaFormat.KEY_HEIGHT,
+                    fmt.getInteger(android.media.MediaFormat.KEY_HEIGHT),
+                )
+            } catch (_: Throwable) {}
+            for (csd in listOf("csd-0", "csd-1")) {
+                try {
+                    if (fmt.containsKey(csd)) clean.setByteBuffer(csd, fmt.getByteBuffer(csd))
+                } catch (_: Throwable) {}
+            }
+            val decoder = android.media.MediaCodec.createDecoderByType(mime)
+            codec = decoder
+            decoder.configure(clean, null, null, 0)
+            decoder.start()
+            onEvent("start mime=$mime rot=$rotation")
+
+            val clock = Clock(opt.speedPct)
+            var bufFrames: ArrayList<android.graphics.Bitmap>? =
+                if (opt.mode == BgOpt.MODE_PINGPONG) ArrayList() else null
+            var bufRels: ArrayList<Long>? =
+                if (opt.mode == BgOpt.MODE_PINGPONG) ArrayList() else null
+            var bufPx = 0L
+
+            var round = 0
+            while (!released) {
+                round++
+                if (round > 1) {
+                    val bf = bufFrames
+                    val br = bufRels
+                    if (bf != null && br != null && bf.size >= 2) {
+                        // 往返的后续轮次：缓存正放 + 倒放，不再解码
+                        if (!playBuffer(bf, br, forward = true, clock)) return
+                        if (!playBuffer(bf, br, forward = false, clock)) return
+                        continue
+                    }
+                    extractor.seekTo(0L, android.media.MediaExtractor.SEEK_TO_CLOSEST_SYNC)
+                    try { decoder.flush() } catch (_: Throwable) {}
+                }
+                val eos = decodeForward(extractor, decoder, rotation, clock) { bmp, rel ->
+                    val bf = bufFrames
+                    val br = bufRels
+                    if (bf != null && br != null) {
+                        bufPx += bmp.width.toLong() * bmp.height.toLong()
+                        if (bufPx > 48_000_000L || bf.size > 240) {
+                            bufFrames = null
+                            bufRels = null
+                        } else {
+                            bf.add(bmp)
+                            br.add(rel)
+                        }
+                    }
+                }
+                if (!eos || released) return
+                when (opt.mode) {
+                    BgOpt.MODE_ONCE -> return
+                    BgOpt.MODE_PINGPONG -> {
+                        val bf = bufFrames
+                        val br = bufRels
+                        if (bf != null && br != null && bf.size >= 2) {
+                            if (!playBuffer(bf, br, forward = false, clock)) return
+                        }
+                        // 缓存被丢弃时退化为循环：下一轮回跳重解
+                    }
+                    else -> Unit // 循环：下一轮回跳重解
+                }
+            }
+        } catch (t: Throwable) {
+            if (!released) onError(t.message ?: "decode error")
+        } finally {
+            try { codec?.stop() } catch (_: Throwable) {}
+            try { codec?.release() } catch (_: Throwable) {}
+            try { extractor.release() } catch (_: Throwable) {}
+            synchronized(this) {
+                if (thread === Thread.currentThread()) thread = null
+            }
+        }
+    }
+
+    /** 正向解码一遍：按时间戳等待后逐帧交付。返回 true = 正常放到流尾。 */
+    private fun decodeForward(
+        extractor: android.media.MediaExtractor,
+        codec: android.media.MediaCodec,
+        rotation: Int,
+        clock: Clock,
+        deliver: (android.graphics.Bitmap, Long) -> Unit,
+    ): Boolean {
+        val info = android.media.MediaCodec.BufferInfo()
+        var inputDone = false
+        var firstPts = -1L
+        var delivered = 0
+        var convertFails = 0
+        val startStamp = android.os.SystemClock.uptimeMillis()
+        clock.restart()
+        while (!released) {
+            // 看门狗：解码器不出帧（格式/厂商坑）时别静默空转，报错退出、海报兜底
+            if (delivered == 0 &&
+                android.os.SystemClock.uptimeMillis() - startStamp > 8_000L
+            ) {
+                onError("no frame decoded in 8s")
+                return false
+            }
+            if (!inputDone) {
+                val inIdx = try {
+                    codec.dequeueInputBuffer(10_000L)
+                } catch (_: Throwable) {
+                    -1
+                }
+                if (inIdx >= 0) {
+                    val buf = codec.getInputBuffer(inIdx) ?: return false
+                    val size = extractor.readSampleData(buf, 0)
+                    if (size < 0) {
+                        codec.queueInputBuffer(
+                            inIdx, 0, 0, 0,
+                            android.media.MediaCodec.BUFFER_FLAG_END_OF_STREAM,
+                        )
+                        inputDone = true
+                    } else {
+                        codec.queueInputBuffer(inIdx, 0, size, extractor.sampleTime, 0)
+                        extractor.advance()
+                    }
+                }
+            }
+            val outIdx = try {
+                codec.dequeueOutputBuffer(info, 10_000L)
+            } catch (_: Throwable) {
+                -1
+            }
+            if (outIdx >= 0) {
+                val eos = info.flags and
+                    android.media.MediaCodec.BUFFER_FLAG_END_OF_STREAM != 0
+                if (info.size > 0) {
+                    if (firstPts < 0) firstPts = info.presentationTimeUs
+                    val rel = info.presentationTimeUs - firstPts
+                    val img = try {
+                        codec.getOutputImage(outIdx)
+                    } catch (_: Throwable) {
+                        null
+                    }
+                    if (img != null) {
+                        val bmp = yuvToBitmap(img, rotation)
+                        img.close()
+                        if (bmp == null) {
+                            convertFails++
+                            if (convertFails > 30) {
+                                onError("frame convert failed x$convertFails")
+                                try { codec.releaseOutputBuffer(outIdx, false) } catch (_: Throwable) {}
+                                return false
+                            }
+                        } else {
+                            convertFails = 0
+                            if (!waitUntil(clock, rel)) {
+                                try { codec.releaseOutputBuffer(outIdx, false) } catch (_: Throwable) {}
+                                return false
+                            }
+                            delivered++
+                            if (delivered == 1) {
+                                onEvent("first frame ${bmp.width}x${bmp.height}")
+                            }
+                            current = bmp
+                            onFrame(bmp)
+                            deliver(bmp, rel)
+                        }
+                    }
+                }
+                try { codec.releaseOutputBuffer(outIdx, false) } catch (_: Throwable) {}
+                if (eos) return true
+            }
+        }
+        return false
+    }
+
+    /** 按缓存帧的相对时间戳正放/倒放一遍（往返模式用，帧已全部解好）。 */
+    private fun playBuffer(
+        frames: List<android.graphics.Bitmap>,
+        rels: List<Long>,
+        forward: Boolean,
+        clock: Clock,
+    ): Boolean {
+        val total = rels.lastOrNull() ?: 0L
+        clock.restart()
+        if (forward) {
+            for (i in frames.indices) {
+                if (!waitUntil(clock, rels[i])) return false
+                current = frames[i]
+                onFrame(frames[i])
+            }
+        } else {
+            for (i in frames.indices.reversed()) {
+                if (!waitUntil(clock, total - rels[i])) return false
+                current = frames[i]
+                onFrame(frames[i])
+            }
+        }
+        val tail = if (rels.size >= 2) {
+            (rels.last() - rels[rels.size - 2]).coerceIn(10_000L, 500_000L)
+        } else {
+            100_000L
+        }
+        return waitUntil(clock, total + tail)
+    }
+
+    /** 解码输出转 Bitmap：整数 BT.601，采样到长边 ≤960 省 CPU，带旋转修正。 */
+    private fun yuvToBitmap(
+        image: android.media.Image,
+        rotation: Int,
+    ): android.graphics.Bitmap? {
+        return try {
+            val crop = image.cropRect
+            val w0 = crop.width()
+            val h0 = crop.height()
+            if (w0 <= 0 || h0 <= 0) return null
+            val step = maxOf(1, (maxOf(w0, h0) + 959) / 960)
+            val w = (w0 + step - 1) / step
+            val h = (h0 + step - 1) / step
+            val yPlane = image.planes[0]
+            val uPlane = image.planes[1]
+            val vPlane = image.planes[2]
+            val yBuf = yPlane.buffer
+            val uBuf = uPlane.buffer
+            val vBuf = vPlane.buffer
+            val pixels = IntArray(w * h)
+            for (yy in 0 until h) {
+                val srcY = crop.top + yy * step
+                val yRow = srcY * yPlane.rowStride
+                val uRow = (srcY / 2) * uPlane.rowStride
+                val vRow = (srcY / 2) * vPlane.rowStride
+                var dst = yy * w
+                for (xx in 0 until w) {
+                    val srcX = crop.left + xx * step
+                    val yv = yBuf.get(yRow + srcX * yPlane.pixelStride).toInt() and 0xFF
+                    val uv = (uBuf.get(uRow + (srcX / 2) * uPlane.pixelStride).toInt() and 0xFF) - 128
+                    val vv = (vBuf.get(vRow + (srcX / 2) * vPlane.pixelStride).toInt() and 0xFF) - 128
+                    val y1192 = 1192 * (yv - 16).coerceAtLeast(0)
+                    val r = ((y1192 + 1634 * vv) shr 10).coerceIn(0, 255)
+                    val g = ((y1192 - 833 * vv - 400 * uv) shr 10).coerceIn(0, 255)
+                    val b = ((y1192 + 2066 * uv) shr 10).coerceIn(0, 255)
+                    pixels[dst++] = (0xFF shl 24) or (r shl 16) or (g shl 8) or b
+                }
+            }
+            var bmp = android.graphics.Bitmap.createBitmap(
+                w, h, android.graphics.Bitmap.Config.ARGB_8888,
+            )
+            bmp.setPixels(pixels, 0, w, 0, 0, w, h)
+            if (rotation != 0) {
+                val m = android.graphics.Matrix().apply { postRotate(rotation.toFloat()) }
+                bmp = android.graphics.Bitmap.createBitmap(bmp, 0, 0, bmp.width, bmp.height, m, true)
+            }
+            bmp
+        } catch (_: Throwable) {
+            null
+        }
+    }
+}
+
+/**
+ * 视频帧包的懒解码帧源：只保存每帧的 JPEG 字节，画到哪帧才解哪帧，
+ * 解码结果按 LRU 只留最近 10 帧。弹窗通常只开几秒，没播到的帧永远不解码——省 CPU、省内存。
+ */
+private class LazyFrames(val jpegs: List<ByteArray>, val delays: IntArray) {
+
+    private val cache = object : java.util.LinkedHashMap<Int, android.graphics.Bitmap>(
+        16, 0.75f, true,
+    ) {
+        override fun removeEldestEntry(
+            eldest: MutableMap.MutableEntry<Int, android.graphics.Bitmap>,
+        ): Boolean = size > 10
+    }
+
+    val size: Int get() = jpegs.size
+
+    @Synchronized
+    fun frame(i: Int): android.graphics.Bitmap? {
+        cache[i]?.let { return it }
+        val jpg = jpegs.getOrNull(i) ?: return null
+        val bmp = try {
+            BitmapFactory.decodeByteArray(jpg, 0, jpg.size)
+        } catch (_: Throwable) {
+            null
+        } ?: return null
+        cache[i] = bmp
+        return bmp
+    }
+}
+
+private class ClippedBgDrawable(
+    private val bitmap: android.graphics.Bitmap?,
+    private val animated: AnimatedImageDrawable?,
+    private val gifBitmaps: List<android.graphics.Bitmap>?,
+    private val gifDelays: IntArray?,
+    private val lazyFrames: LazyFrames?,
+    private val videoBytes: ByteArray?,
+    private val opt: BgOpt,
+    private val radii: FloatArray,
+    private val bgLog: (String) -> Unit = {},
+) : Drawable(), Drawable.Callback {
+
+    private val path = Path()
+    private val srcRect = Rect()
+    private val dstRect = RectF()
+
+    // ---- 视频直放（原视频字节在时才建播放器；帧经主线程回调刷新） ----
+    @Volatile private var videoFrame: android.graphics.Bitmap? = null
+    @Volatile private var videoErrors = 0
+    private val videoPlayer: VideoBgPlayer? = if (videoBytes != null) {
+        VideoBgPlayer(
+            bytes = videoBytes,
+            opt = opt,
+            onFrame = { bmp ->
+                videoFrame = bmp
+                gifHandler.post { invalidateSelf() }
+            },
+            onError = { msg ->
+                videoErrors++
+                bgLog("error: $msg")
+            },
+            onEvent = { msg -> bgLog(msg) },
+        )
+    } else {
+        null
+    }
+
+    // ---- 自有播放时钟（GIF 帧 / 视频懒帧共用） ----
+    private val frameDelays: IntArray? = gifDelays ?: lazyFrames?.delays
+    private val frameCount: Int = gifBitmaps?.size ?: lazyFrames?.size ?: 0
+    private val gifTimeline: GifTimeline? =
+        if (frameCount >= 2 && frameDelays != null) {
+            GifTimeline(frameDelays, opt.mode)
+        } else {
+            null
+        }
+    private val gifHandler = android.os.Handler(android.os.Looper.getMainLooper())
+    private var gifPlaying = false
+    private var gifWantPlay = false
+    private var gifDone = false
+    private var gifStartStamp = 0L
+    private var gifElapsedBase = 0L
+    private var gifFrame = 0
+    private val gifTick = object : Runnable {
+        override fun run() {
+            val tl = gifTimeline ?: return
+            if (!gifPlaying) return
+            val eff = GifTimeline.effective(
+                gifElapsedBase + (android.os.SystemClock.uptimeMillis() - gifStartStamp),
+                opt.speedPct,
+            )
+            val idx = tl.frameAt(eff)
+            if (idx != gifFrame) {
+                gifFrame = idx
+                invalidateSelf()
+            }
+            if (tl.isFinished(eff)) {
+                gifPlaying = false
+                gifDone = true
+                return
+            }
+            val nextEff = tl.nextChangeAt(eff)
+            if (nextEff == Long.MAX_VALUE) {
+                gifPlaying = false
+                gifDone = true
+                return
+            }
+            val delayReal = ((nextEff - eff) * 100 / opt.speedPct).coerceIn(2L, 60_000L) + 1
+            gifHandler.postDelayed(this, delayReal)
+        }
+    }
+
+    init {
+        animated?.callback = this
+    }
+
+    fun startIfAnimated() {
+        try { animated?.start() } catch (_: Throwable) {}
+        try { videoPlayer?.start() } catch (_: Throwable) {}
+        gifWantPlay = true
+        gifDone = false
+        startGif()
+    }
+
+    /** 背景被换掉时停掉一切播放（视频解码线程、GIF 时钟、系统动图）。 */
+    fun release() {
+        gifWantPlay = false
+        pauseGif()
+        try { videoPlayer?.release() } catch (_: Throwable) {}
+        try { animated?.stop() } catch (_: Throwable) {}
+    }
+
+    private fun startGif() {
+        if (gifTimeline == null || gifPlaying || !gifWantPlay) return
+        gifPlaying = true
+        gifStartStamp = android.os.SystemClock.uptimeMillis()
+        gifHandler.removeCallbacks(gifTick)
+        gifHandler.post(gifTick)
+    }
+
+    private fun pauseGif() {
+        if (!gifPlaying) return
+        gifElapsedBase += android.os.SystemClock.uptimeMillis() - gifStartStamp
+        gifPlaying = false
+        gifHandler.removeCallbacks(gifTick)
+    }
+
+    // AnimatedImageDrawable 靠可见性/状态回调驱动帧推进；作 background 时这些
+    // 回调先到本包装层，必须转发给内层，否则动图会停在第一帧（v1.23 的病根）。
+    // GIF 时钟同样跟可见性走：不可见就暂停，省电且不空转。
+    override fun setVisible(visible: Boolean, restart: Boolean): Boolean {
+        try { animated?.setVisible(visible, restart) } catch (_: Throwable) {}
+        try {
+            if (visible) videoPlayer?.start() else videoPlayer?.pause()
+        } catch (_: Throwable) {}
+        if (visible) startGif() else pauseGif()
+        return super.setVisible(visible, restart)
+    }
+
+    override fun onStateChange(state: IntArray): Boolean {
+        try { animated?.state = state } catch (_: Throwable) {}
+        return super.onStateChange(state)
+    }
+
+    override fun onLevelChange(level: Int): Boolean {
+        try { animated?.level = level } catch (_: Throwable) {}
+        return super.onLevelChange(level)
+    }
+
+    override fun jumpToCurrentState() {
+        try { animated?.jumpToCurrentState() } catch (_: Throwable) {}
+        super.jumpToCurrentState()
+    }
+
+    override fun onBoundsChange(bounds: Rect) {
+        super.onBoundsChange(bounds)
+        path.reset()
+        if (bounds.width() > 0 && bounds.height() > 0) {
+            path.addRoundRect(
+                bounds.left.toFloat(), bounds.top.toFloat(),
+                bounds.right.toFloat(), bounds.bottom.toFloat(),
+                radii, Path.Direction.CW,
+            )
+        }
+    }
+
+    /**
+     * 显示区域：先算「刚好填满卡片」的缩放，再按 scalePct 放大，
+     * 可见窗口按 focus（千分比）在图上滑动。返回源图上的可见矩形。
+     */
+    private fun cropRect(sw: Int, sh: Int, dw: Int, dh: Int): Rect {
+        val s0 = maxOf(dw.toFloat() / sw, dh.toFloat() / sh)
+        val s = s0 * opt.scalePct / 100f
+        val vw = (dw / s).coerceIn(1f, sw.toFloat())
+        val vh = (dh / s).coerceIn(1f, sh.toFloat())
+        val maxOx = (sw - vw).coerceAtLeast(0f)
+        val maxOy = (sh - vh).coerceAtLeast(0f)
+        val ox = (opt.focusX / 1000f * maxOx).toInt()
+        val oy = (opt.focusY / 1000f * maxOy).toInt()
+        return Rect(ox, oy, ox + vw.toInt().coerceAtLeast(1), oy + vh.toInt().coerceAtLeast(1))
+    }
+
+    override fun draw(canvas: Canvas) {
+        val b = bounds
+        if (b.width() <= 0 || b.height() <= 0) return
+        // 启动自愈：贴图/可见性回调时序不对、动画没被拉起来时，draw 发现就补启动
+        if (isVisible) {
+            if (gifTimeline != null && !gifPlaying && !gifDone) {
+                gifWantPlay = true
+                startGif()
+            }
+            if (videoPlayer != null && videoFrame == null && videoErrors < 2) {
+                try { videoPlayer.start() } catch (_: Throwable) {}
+            }
+        }
+        canvas.save()
+        if (!path.isEmpty) canvas.clipPath(path)
+        val anim = animated
+        val frames = gifBitmaps
+        when {
+            anim != null -> {
+                val iw = anim.intrinsicWidth
+                val ih = anim.intrinsicHeight
+                if (iw > 0 && ih > 0) {
+                    val s0 = maxOf(b.width().toFloat() / iw, b.height().toFloat() / ih)
+                    val s = s0 * opt.scalePct / 100f
+                    val vw = (b.width() / s).coerceIn(1f, iw.toFloat())
+                    val vh = (b.height() / s).coerceIn(1f, ih.toFloat())
+                    val ox = opt.focusX / 1000f * (iw - vw).coerceAtLeast(0f)
+                    val oy = opt.focusY / 1000f * (ih - vh).coerceAtLeast(0f)
+                    anim.bounds = Rect(
+                        (b.left - ox * s).toInt(), (b.top - oy * s).toInt(),
+                        (b.left + (iw - ox) * s).toInt(), (b.top + (ih - oy) * s).toInt(),
+                    )
+                } else {
+                    anim.bounds = b
+                }
+                anim.draw(canvas)
+            }
+            videoPlayer != null -> {
+                // 还没解出帧（或解码失败）时先画海报静态图，背景不空
+                val bmp = videoFrame ?: bitmap
+                if (bmp != null) {
+                    val src = cropRect(bmp.width, bmp.height, b.width(), b.height())
+                    dstRect.set(b.left.toFloat(), b.top.toFloat(), b.right.toFloat(), b.bottom.toFloat())
+                    canvas.drawBitmap(bmp, src, dstRect, null)
+                }
+            }
+            frames != null && frames.isNotEmpty() -> {
+                val bmp = frames[gifFrame.coerceIn(0, frames.size - 1)]
+                val src = cropRect(bmp.width, bmp.height, b.width(), b.height())
+                dstRect.set(b.left.toFloat(), b.top.toFloat(), b.right.toFloat(), b.bottom.toFloat())
+                canvas.drawBitmap(bmp, src, dstRect, null)
+            }
+            lazyFrames != null -> {
+                val bmp = lazyFrames.frame(gifFrame.coerceIn(0, lazyFrames.size - 1))
+                if (bmp != null) {
+                    val src = cropRect(bmp.width, bmp.height, b.width(), b.height())
+                    dstRect.set(b.left.toFloat(), b.top.toFloat(), b.right.toFloat(), b.bottom.toFloat())
+                    canvas.drawBitmap(bmp, src, dstRect, null)
+                }
+            }
+            bitmap != null -> {
+                val src = cropRect(bitmap.width, bitmap.height, b.width(), b.height())
+                dstRect.set(b.left.toFloat(), b.top.toFloat(), b.right.toFloat(), b.bottom.toFloat())
+                canvas.drawBitmap(bitmap, src, dstRect, null)
+            }
+        }
+        canvas.restore()
+    }
+
+    override fun setAlpha(alpha: Int) {
+        animated?.alpha = alpha
+    }
+
+    override fun setColorFilter(colorFilter: ColorFilter?) {
+        animated?.colorFilter = colorFilter
+    }
+
+    @Suppress("DEPRECATION")
+    override fun getOpacity(): Int = PixelFormat.TRANSLUCENT
+
+    override fun getOutline(outline: Outline) {
+        val maxR = radii.maxOrNull() ?: 0f
+        if (maxR > 0f) outline.setRoundRect(bounds, maxR) else super.getOutline(outline)
+    }
+
+    override fun invalidateDrawable(who: Drawable) {
+        invalidateSelf()
+    }
+
+    override fun scheduleDrawable(who: Drawable, what: Runnable, `when`: Long) {
+        scheduleSelf(what, `when`)
+    }
+
+    override fun unscheduleDrawable(who: Drawable, what: Runnable) {
+        unscheduleSelf(what)
     }
 }

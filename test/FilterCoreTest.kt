@@ -39,6 +39,23 @@ fun main() {
     check("parse disabled", !cfg2.enabled)
     check("parse whitelist 2", cfg2.whitelist == setOf(otherMac, myMac))
     check("parse debug", cfg2.debug)
+    check("parse bg default empty", cfg2.bgMap.isEmpty())
+    val myKey = MacUtil.keyOf(myMac)!!
+    val cfgBg = FilterConfig.parse(
+        FilterConfig.render(true, setOf(myMac), 0L, false, mapOf("all" to 7L, myKey to 3L)),
+    )
+    check("render/parse bg_map", cfgBg.bgMap == mapOf("all" to 7L, myKey to 3L))
+    val cfgBg2 = FilterConfig.of(true, "", 0L, false, "all:9")
+    check("of bg_map", cfgBg2.bgMap == mapOf("all" to 9L))
+    check("bgKeyFor specific wins", cfgBg.bgKeyFor(myMac) == myKey)
+    check("bgKeyFor falls back to all", cfgBg.bgKeyFor(otherMac) == "all")
+    check("bgKeyFor none", FilterConfig().bgKeyFor(myMac) == null)
+    check("bgKeysFor order specific-then-all", cfgBg.bgKeysFor(myMac) == listOf(myKey, "all"))
+    check("bgKeysFor all only", cfgBg.bgKeysFor(otherMac) == listOf("all"))
+    check("bgKeysFor empty", FilterConfig().bgKeysFor(myMac).isEmpty())
+    val cfgLegacy = FilterConfig.parse("enabled=1\nbg_version=4\n")
+    check("legacy bg_version -> all", cfgLegacy.bgMap == mapOf("all" to 4L))
+    check("keyOf/macOfKey roundtrip", MacUtil.macOfKey(myKey) == myMac)
 
     val base = FilterConfig(enabled = true, whitelist = setOf(myMac), bypassUntilMs = 0)
     fun probe(mac: String? = otherMac, bonded: Boolean? = false, name: String? = "Redmi Buds 5",
