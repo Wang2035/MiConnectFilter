@@ -401,6 +401,32 @@ object BgStore {
         return v
     }
 
+    /** 把背景从一组 key 搬到另一组 key（文件/海报/帧信息一起搬；播放设置由调用方随后写入新 key）。 */
+    fun move(ctx: Context, fromKeys: List<String>, toKeys: List<String>) {
+        val src = fromKeys.firstOrNull { exists(ctx, it) } ?: return
+        val mime = mimeFor(ctx, src) ?: "application/octet-stream"
+        val frames = frameInfo(ctx, src)
+        val posterSrc = posterFile(ctx, src)
+        val hasPoster = posterSrc.exists()
+        for (k in toKeys) {
+            if (k == src) continue
+            fileFor(ctx, src).copyTo(fileFor(ctx, k), overwrite = true)
+            val p = ConfSync.prefs(ctx)
+            val v = p.getLong("bg_ver_$k", 0L) + 1
+            p.edit().putString("bg_mime_$k", mime).putLong("bg_ver_$k", v)
+                .remove("bg_frames_$k").apply()
+            if (frames != null) setFrameInfo(ctx, k, frames.first, frames.second)
+            if (hasPoster) {
+                posterSrc.copyTo(posterFile(ctx, k), overwrite = true)
+            } else {
+                try { posterFile(ctx, k).delete() } catch (_: Throwable) {}
+            }
+        }
+        for (k in fromKeys) {
+            if (k !in toKeys) clear(ctx, k)
+        }
+    }
+
     /** 某 key 的播放/显示选项。 */
     fun optFor(ctx: Context, key: String): BgOpt =
         BgOpt.parse(ConfSync.prefs(ctx).getString("bg_opt_$key", null))

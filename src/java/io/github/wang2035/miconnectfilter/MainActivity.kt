@@ -65,6 +65,9 @@ class MainActivity : Activity() {
 
     private companion object {
         const val REQ_PICK_BG = 4211
+
+        /** 真机弹窗卡片宽高比（按用户截图量得：卡片 864×987，截图宽 921）。 */
+        const val POPUP_CARD_RATIO = 0.875f
     }
     private val chipViews = HashMap<Int, TextView>()
     private var bypassMinutes = FilterCore.MAX_BYPASS_MINUTES
@@ -162,7 +165,21 @@ class MainActivity : Activity() {
         // 上次没走完的导入残留（取消选目标等）清掉，不长期占着
         try { java.io.File(cacheDir, "pending_bg.zip").delete() } catch (_: Throwable) {}
         try { java.io.File(cacheDir, "bg_frames_tmp").deleteRecursively() } catch (_: Throwable) {}
+        migrateFontColorPref()
         migrateNativeVideos()
+    }
+
+    /** v1.41 前字体颜色是全局一档；迁到每个背景自己的设置里，迁完清掉全局值免得误会。 */
+    private fun migrateFontColorPref() {
+        try {
+            val g = prefs.getInt("font_color", 0).coerceIn(0, 2)
+            if (g == 0) return
+            for (key in BgStore.keys(this)) {
+                val o = BgStore.optFor(this, key)
+                if (o.fontColor == 0) BgStore.setOpt(this, key, o.copy(fontColor = g))
+            }
+            prefs.edit().putInt("font_color", 0).apply()
+        } catch (_: Throwable) {}
     }
 
     /**
@@ -279,10 +296,6 @@ class MainActivity : Activity() {
             }
         }
         ctlCard.addView(row("诊断日志", debugSwitch))
-        val logBtn = capsule("拦截记录", filled = false).apply {
-            setOnClickListener { showLog() }
-        }
-        ctlCard.addView(logBtn)
         val diagBtn = capsule("查看日志", filled = false).apply {
             setOnClickListener { showDiagLog() }
         }
@@ -320,30 +333,8 @@ class MainActivity : Activity() {
             addView(pText)
         }
         bgCard.addView(bgProgressRow)
-        bgCard.addView(txt("照片、动态图、视频都行（视频按原帧率播放）；长按已有背景可以修改播放方式、速度和显示区域。单独给某台耳机设的优先于全部设备。", 13f, subC).apply {
+        bgCard.addView(txt("照片、动态图、视频都行（视频按原帧率播放）；点开已有背景可以修改播放方式、速度、显示区域和字体颜色（字体颜色只对这个背景的弹窗生效）。单独给某台耳机设的优先于全部设备。", 13f, subC).apply {
             setPadding(0, dp(4), 0, dp(8))
-        })
-        bgCard.addView(View(this).apply {
-            setBackgroundColor(Color.parseColor(dividerC))
-            layoutParams = LinearLayout.LayoutParams(
-                ViewGroup.LayoutParams.MATCH_PARENT, 1,
-            ).apply { topMargin = dp(6); bottomMargin = dp(2) }
-        })
-        bgCard.addView(txt("弹窗字体颜色", 15f, titleC).apply {
-            setPadding(0, dp(8), 0, dp(6))
-        })
-        bgCard.addView(
-            chipGroup(
-                listOf("系统", "白字", "黑字"),
-                prefs.getInt("font_color", 0).coerceIn(0, 2),
-                { true },
-            ) { idx ->
-                prefs.edit().putInt("font_color", idx).apply()
-                syncAsync(showError = false)
-            },
-        )
-        bgCard.addView(txt("「系统」跟随系统深色/浅色模式自动变；白字/黑字强制弹窗文字为该颜色，配深色或浅色背景图时用。", 12.5f, subC).apply {
-            setPadding(0, dp(6), 0, 0)
         })
         root.addView(bgCard)
 
@@ -400,21 +391,30 @@ class MainActivity : Activity() {
 
         root.addView(txt("不在白名单的小米耳机弹窗都会拦，包括已配对的；先把自己的耳机加进白名单。", 13f, subC))
         root.addView(txt("作用域用 LSPosed 推荐勾选（6 个全选）；改完点「重启作用域应用」。", 13f, subC))
-        root.addView(txt("项目地址：github.com/Wang2035/MiConnectFilter", 13f, accent).apply {
-            setPadding(0, dp(8), 0, 0)
-            setOnClickListener {
-                try {
-                    startActivity(
-                        android.content.Intent(
-                            android.content.Intent.ACTION_VIEW,
-                            android.net.Uri.parse("https://github.com/Wang2035/MiConnectFilter"),
-                        ),
-                    )
-                } catch (_: Throwable) {
-                    toast("没有可用的浏览器")
-                }
+        // 关于：项目地址单独一栏（用户要求，不再放页脚小字）
+        val aboutCard = card()
+        val ghRow = row("项目地址", txt("›", 20f, subC))
+        ghRow.setOnClickListener {
+            try {
+                startActivity(
+                    android.content.Intent(
+                        android.content.Intent.ACTION_VIEW,
+                        android.net.Uri.parse("https://github.com/Wang2035/MiConnectFilter"),
+                    ),
+                )
+            } catch (_: Throwable) {
+                toast("没有可用的浏览器")
             }
-        })
+        }
+        aboutCard.addView(ghRow)
+        val verTxt = valueText()
+        verTxt.text = try {
+            packageManager.getPackageInfo(packageName, 0).versionName ?: ""
+        } catch (_: Throwable) {
+            ""
+        }
+        aboutCard.addView(row("版本", verTxt, withDivider = false))
+        root.addView(aboutCard)
 
         paintChips()
         updateBypassUi()
@@ -639,6 +639,7 @@ class MainActivity : Activity() {
                 parts.add((opt.speedPct / 100.0).toString().trimEnd('0').trimEnd('.') + "×")
             }
         }
+        if (opt.fontColor == 1) parts.add("白字") else if (opt.fontColor == 2) parts.add("黑字")
         if (opt.scalePct != 100) parts.add("区域 ${opt.scalePct}%")
         if (key == BgStore.ALL) {
             parts.add("所有放行的耳机弹窗")
@@ -913,13 +914,16 @@ class MainActivity : Activity() {
             cur = BgStore.optFor(this, key)
         }
 
+        var curKeys: List<String> =
+            if (isNew) listOf(BgStore.ALL) else (editKeys ?: emptyList())
+
         val content = LinearLayout(this).apply { orientation = LinearLayout.VERTICAL }
 
         // 预览（静态首帧，拖动调区域；设置页不播动图，省电省性能）
         val preview = ImageView(this).apply {
             scaleType = ImageView.ScaleType.MATRIX
             layoutParams = LinearLayout.LayoutParams(
-                ViewGroup.LayoutParams.MATCH_PARENT, dp(168),
+                ViewGroup.LayoutParams.MATCH_PARENT, dp(240),
             )
             background = GradientDrawable().apply {
                 setColor(Color.parseColor(chipBg))
@@ -1027,6 +1031,28 @@ class MainActivity : Activity() {
         }
         content.addView(zoom)
 
+        content.addView(sheetLabel("用在哪个弹窗"))
+        val targetRow = txt(bgTargetName(curKeys), 15f, accent).apply {
+            setPadding(dp(4), dp(10), dp(4), dp(10))
+            setOnClickListener {
+                showBgTargetChooserDialog(curKeys) { keys ->
+                    curKeys = keys
+                    text = bgTargetName(keys)
+                }
+            }
+        }
+        content.addView(targetRow)
+
+        content.addView(sheetLabel("字体颜色（只对这个背景的弹窗生效）"))
+        content.addView(
+            chipGroup(
+                labels = listOf("系统", "白字", "黑字"),
+                initial = cur.fontColor,
+                enabled = { true },
+                onPick = { i -> cur = cur.copy(fontColor = i) },
+            ),
+        )
+
         if (kind != 0) {
             content.addView(sheetLabel("播放完后"))
             content.addView(
@@ -1090,17 +1116,41 @@ class MainActivity : Activity() {
             }
         }
 
+        // 面板内容变高了（预览按弹窗比例 + 设置项变多），原对话框不滚动会把
+        // 按钮顶出屏幕：内容包一层滚动并限高，按钮始终留在对话框底部
+        val scrollContent = object : android.widget.ScrollView(this) {
+            private var downInPreview = false
+
+            override fun onInterceptTouchEvent(ev: android.view.MotionEvent): Boolean {
+                // 手势落在预览图上时不拦截，留给预览自己拖动取景
+                when (ev.actionMasked) {
+                    android.view.MotionEvent.ACTION_DOWN -> {
+                        val loc = IntArray(2)
+                        preview.getLocationInWindow(loc)
+                        downInPreview = ev.rawX >= loc[0] && ev.rawX < loc[0] + preview.width &&
+                            ev.rawY >= loc[1] && ev.rawY < loc[1] + preview.height
+                        if (downInPreview) return false
+                    }
+                    android.view.MotionEvent.ACTION_MOVE -> if (downInPreview) return false
+                    android.view.MotionEvent.ACTION_UP,
+                    android.view.MotionEvent.ACTION_CANCEL -> downInPreview = false
+                }
+                return super.onInterceptTouchEvent(ev)
+            }
+        }
+        scrollContent.addView(content)
         MiuixUi.showDialog(
             this,
             title = "背景设置",
-            content = content,
-            positiveText = if (isNew) "下一步" else "保存",
+            content = scrollContent,
+            positiveText = "保存",
             onPositive = {
                 if (isNew) {
                     pendingBgOpt = cur
-                    showBgTargetChooser()
+                    savePendingBg(curKeys)
                 } else if (editKeys != null) {
-                    for (k in editKeys) BgStore.setOpt(this, k, cur)
+                    if (curKeys != editKeys) BgStore.move(this, editKeys, curKeys)
+                    for (k in curKeys) BgStore.setOpt(this, k, cur)
                     refreshBgUi()
                     syncAsync(showError = true)
                     toast("已保存，下次弹窗生效")
@@ -1108,37 +1158,134 @@ class MainActivity : Activity() {
             },
             negativeText = if (!isNew && viaLongPress) "关闭" else "取消",
         )
+        scrollContent.post {
+            val maxH = (resources.displayMetrics.heightPixels * 0.58f).toInt()
+            if (scrollContent.height > maxH) {
+                scrollContent.layoutParams.height = maxH
+                scrollContent.requestLayout()
+            }
+        }
+        // 预览比例与真机弹窗卡片一致（宽高比 0.875），所见即所得
+        preview.addOnLayoutChangeListener { v, _, _, _, _, _, _, _, _ ->
+            val w = v.width
+            if (w > 0) {
+                val target = (w / POPUP_CARD_RATIO).toInt()
+                if (kotlin.math.abs(target - v.layoutParams.height) > 1) {
+                    v.layoutParams.height = target
+                    v.requestLayout()
+                    updatePreview()
+                }
+            }
+        }
         preview.post { updatePreview() }
     }
 
-    /** 选完图后挑用途：全部设备，或某台耳机（同名设备的多个地址合并成一项，一起设置）。 */
-    private fun showBgTargetChooser() {
-        val groups = LinkedHashMap<String, MutableList<String>>()
-        groups["全部设备"] = arrayListOf(BgStore.ALL)
+    /** 「这张图用在哪个弹窗？」多选框：可同时选多台设备；「全部设备」与单台互斥。 */
+    private fun showBgTargetChooserDialog(
+        initialKeys: List<String>,
+        onPick: (List<String>) -> Unit,
+    ) {
+        val groups = LinkedHashMap<String, List<String>>()
+        groups["全部设备"] = listOf(BgStore.ALL)
+        val grouped = LinkedHashMap<String, MutableList<String>>()
         for ((mac, label) in ConfSync.readWhitelist(prefs)) {
             val key = MacUtil.keyOf(mac) ?: continue
             val name = label.takeIf { it.isNotBlank() && it != mac } ?: mac
-            groups.getOrPut(name) { ArrayList() }.add(key)
+            grouped.getOrPut(name) { ArrayList() }.add(key)
         }
+        for ((k, v) in grouped) groups[k] = v
+
+        val selected = LinkedHashSet<String>()
+        if (initialKeys.contains(BgStore.ALL)) {
+            selected.add("全部设备")
+        } else {
+            for ((label, keys) in groups) {
+                if (label != "全部设备" && keys.all { it in initialKeys }) selected.add(label)
+            }
+        }
+
         val list = LinearLayout(this).apply { orientation = LinearLayout.VERTICAL }
-        var dialog: android.app.Dialog? = null
-        for ((label, keys) in groups) {
-            val suffix = if (keys.any { BgStore.exists(this, it) }) "（已有背景，将替换）" else ""
-            list.addView(txt(label + suffix, 16f, titleC).apply {
-                setPadding(dp(4), dp(13), dp(4), dp(13))
-                setOnClickListener {
-                    dialog?.dismiss()
-                    savePendingBg(keys)
+        val marks = HashMap<String, TextView>()
+        fun refreshMarks() {
+            for ((label, mark) in marks) {
+                val on = label in selected
+                mark.text = if (on) "✓" else ""
+                (mark.background as? GradientDrawable)?.let { g ->
+                    g.setColor(Color.parseColor(if (on) "#3482FF" else "#00000000"))
+                    g.setStroke(dp(1), Color.parseColor(if (on) "#3482FF" else "#C7C7CC"))
                 }
-            })
+            }
         }
-        dialog = MiuixUi.showDialog(
+        for ((label, keys) in groups) {
+            val row = LinearLayout(this).apply {
+                orientation = LinearLayout.HORIZONTAL
+                gravity = Gravity.CENTER_VERTICAL
+                setPadding(dp(4), dp(11), dp(4), dp(11))
+                isClickable = true
+            }
+            val mark = TextView(this).apply {
+                textSize = 12f
+                setTextColor(Color.WHITE)
+                gravity = Gravity.CENTER
+                background = GradientDrawable().apply { shape = GradientDrawable.OVAL }
+                layoutParams = LinearLayout.LayoutParams(dp(22), dp(22)).apply {
+                    rightMargin = dp(12)
+                }
+            }
+            marks[label] = mark
+            row.addView(mark)
+            val suffix = if (keys.any { BgStore.exists(this, it) } &&
+                keys.none { it in initialKeys }
+            ) {
+                "（已有背景，将替换）"
+            } else {
+                ""
+            }
+            row.addView(txt(label + suffix, 16f, titleC))
+            row.setOnClickListener {
+                if (label == "全部设备") {
+                    selected.clear()
+                    selected.add(label)
+                } else {
+                    selected.remove("全部设备")
+                    if (!selected.add(label)) selected.remove(label)
+                }
+                refreshMarks()
+            }
+            list.addView(row)
+        }
+        refreshMarks()
+        MiuixUi.showDialog(
             this,
             title = "这张图用在哪个弹窗？",
             content = list,
-            positiveText = null,
+            positiveText = "确定",
+            onPositive = {
+                if (selected.isEmpty()) {
+                    toast("至少选一个")
+                } else {
+                    onPick(selected.flatMap { groups[it].orEmpty() })
+                }
+            },
             negativeText = "取消",
         )
+    }
+
+    /** 一组背景 key 的显示名：全部设备，或一台/多台设备的名称。 */
+    private fun bgTargetName(keys: List<String>): String {
+        if (keys.contains(BgStore.ALL)) return "全部设备"
+        val wl = ConfSync.readWhitelist(prefs)
+        val names = LinkedHashSet<String>()
+        for (k in keys) {
+            val mac = MacUtil.macOfKey(k) ?: continue
+            val label = wl.firstOrNull { it.first == mac }?.second
+            names.add(label?.takeIf { it.isNotBlank() && it != mac } ?: mac)
+        }
+        return when {
+            names.isEmpty() -> "—"
+            names.size == 1 -> names.first()
+            else -> "${names.first()} 等 ${names.size} 台"
+        }
     }
 
     private fun savePendingBg(keys: List<String>) {
@@ -1793,39 +1940,6 @@ class MainActivity : Activity() {
     }
 
     // ---------- 记录 / 状态 ----------
-
-    private fun showLog() {
-        Thread {
-            val fileLog = RootUtil.readLogTail(40)
-            val (_, lc) = RootUtil.execSu(
-                "logcat -d -s MiConnectFilter:* 2>/dev/null | grep -E 'EVT|CONFIG|INIT|HOOK|SCAN|config' | tail -n 80",
-            )
-            val lcLines = lc.lines().map { line ->
-                val idx = line.indexOf("MiConnectFilter:")
-                if (idx >= 0) line.substring(idx + "MiConnectFilter:".length).trim() else line
-            }.filter { it.isNotBlank() }
-            val parts = ArrayList<String>()
-            if (lcLines.isNotEmpty()) parts.add(lcLines.joinToString("\n"))
-            if (fileLog.isNotBlank()) parts.add(fileLog)
-            val pretty = if (parts.isEmpty()) "暂无记录" else parts.joinToString("\n")
-            runOnUiThread {
-                MiuixUi.showDialog(
-                    this,
-                    title = "拦截记录",
-                    message = pretty,
-                    positiveText = "关闭",
-                    negativeText = "清除",
-                    onNegative = {
-                        Thread {
-                            RootUtil.clearLog()
-                            RootUtil.execSu("logcat -c 2>/dev/null")
-                        }.start()
-                    },
-                    scrollMessage = true,
-                )
-            }
-        }.start()
-    }
 
     /** 汇总一份完整排查文本：版本/系统/当前设置/配置文件/logcat 与事件记录。 */
     private fun buildDiagText(): String {

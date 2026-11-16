@@ -25,7 +25,8 @@ enum class Decision { ALLOW, BLOCK, PASS }
 /**
  * 弹窗背景播放/显示选项（每个背景 key 一份，随配置下发）：
  * mode：0=循环 1=播一次停在最后一帧 2=往返（正放完倒放）；speedPct：播放速度百分比；
- * focusX/focusY：显示区域中心（千分比）；scalePct：区域缩放（100=刚好填满卡片，越大越放大）。
+ * focusX/focusY：显示区域中心（千分比）；scalePct：区域缩放（100=刚好填满卡片，越大越放大）；
+ * fontColor：这个背景的弹窗字体颜色（0=系统 1=白字 2=黑字，只对贴了这个背景的弹窗生效）。
  */
 data class BgOpt(
     // 默认播一次停在最后一帧（用户 2026-11-16 定），要循环/往返在背景设置里改
@@ -34,9 +35,13 @@ data class BgOpt(
     val focusX: Int = 500,
     val focusY: Int = 500,
     val scalePct: Int = 100,
+    val fontColor: Int = 0,
 ) {
-    /** "mode:speed:fx:fy:scale" */
-    fun render(): String = "$mode:$speedPct:$focusX:$focusY:$scalePct"
+    /** "mode:speed:fx:fy:scale[:font]"（font=0 时省略，兼容旧格式） */
+    fun render(): String {
+        val base = "$mode:$speedPct:$focusX:$focusY:$scalePct"
+        return if (fontColor != 0) "$base:$fontColor" else base
+    }
 
     companion object {
         const val MODE_LOOP = 0
@@ -54,6 +59,11 @@ data class BgOpt(
                 focusX = (p[2].toIntOrNull() ?: 500).coerceIn(0, 1000),
                 focusY = (p[3].toIntOrNull() ?: 500).coerceIn(0, 1000),
                 scalePct = (p[4].toIntOrNull() ?: 100).coerceIn(100, 300),
+                fontColor = if (p.size >= 6) {
+                    (p[5].toIntOrNull() ?: 0).coerceIn(0, 2)
+                } else {
+                    0
+                },
             )
         }
 

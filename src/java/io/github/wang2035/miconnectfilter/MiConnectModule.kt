@@ -146,20 +146,29 @@ class MiConnectModule : XposedModule() {
         try {
             val root = activity.window?.decorView ?: return
             decorateRoot(root, mac, activity.applicationContext)
-            applyFontColor(root)
+            applyFontColorForRoot(root)
         } catch (_: Throwable) {}
     }
 
     // ------------------------------------------------------------ 弹窗字体颜色
-    // 设置项 fontColor：0=系统（不改，弹窗自己跟随深色/浅色） 1=白字 2=黑字。
+    // 字体颜色跟着背景走（BgOpt.fontColor，每个背景一份）：0=系统（不改）1=白字 2=黑字。
+    // 只对真正贴了自定义背景的弹窗生效——没贴背景的弹窗一个字都不碰。
     // 只改 TextView 的文字/提示色，不动图标与背景；弹窗内容常在窗口加上后才
     // 填充，每个根再补三次延时重刷兜底。系统模式不进这里，零干预。
 
     private val fontAppliedRoots: MutableMap<View, Int> =
         Collections.synchronizedMap(WeakHashMap())
 
-    private fun applyFontColor(root: View) {
-        val mode = config.fontColor
+    /** 已贴背景的窗口根 -> 该背景的字体颜色档。 */
+    private val bgFontByRoot: MutableMap<View, Int> =
+        Collections.synchronizedMap(WeakHashMap())
+
+    private fun applyFontColorForRoot(root: View) {
+        val mode = synchronized(bgFontByRoot) { bgFontByRoot[root] } ?: return
+        applyFontColor(root, mode)
+    }
+
+    private fun applyFontColor(root: View, mode: Int) {
         if (mode != FilterConfig.FONT_WHITE && mode != FilterConfig.FONT_BLACK) return
         val color = if (mode == FilterConfig.FONT_WHITE) {
             android.graphics.Color.WHITE
@@ -658,16 +667,21 @@ class MiConnectModule : XposedModule() {
                 if (bgRootTokens[root] == token) {
                     // 已贴好：重试轮次顺手把卡片背景里的动图再 start 一次，防首次启动时机不对
                     restartCardBg(root)
+                    applyFontColorForRoot(root)
                 } else {
                     val card = findCardIn(root)
                     if (card != null && cardBgTokens[card] == token) {
                         // 同一张卡已经贴着同版本背景：只补 start，不重建（重建会从头播）
                         restartCardBg(root)
+                        applyFontColorForRoot(root)
                     } else if (card != null) {
                         val content = buildBgContent(bytes, key, version)
                         if (content != null && applyToCard(card, content, key)) {
                             bgRootTokens[root] = token
                             cardBgTokens[card] = token
+                            val fc = config.bgOptFor(key).fontColor
+                            synchronized(bgFontByRoot) { bgFontByRoot[root] = fc }
+                            applyFontColor(root, fc)
                             log(
                                 "BGAPPLY", null,
                                 "key=$key kind=${content.kind} bytes=${bytes.size} pkg=$targetPackage",
@@ -1339,15 +1353,15 @@ class MiConnectModule : XposedModule() {
                                 // 放行的耳机窗口：弹窗若是独立窗口/Dialog，Activity 层
                                 // 够不到，就在这里给这个窗口的卡片贴背景
                                 decorateRoot(view, probe.mac, view.context.applicationContext)
-                                applyFontColor(view)
-                            } else if (config.bgMap.isNotEmpty() || config.fontColor != FilterConfig.FONT_SYSTEM) {
+                                applyFontColorForRoot(view)
+                            } else if (config.bgMap.isNotEmpty()) {
                                 // 改过名的耳机（如改成玩笑名）文字里没有任何耳机关键词，
                                 // 窗口层此前直接放行、背景永远贴不上。用最近一次弹窗探测
                                 // 的 MAC 兜底，只贴背景不参与拦截判定。
                                 val macHint = probe.mac ?: latestRecentMac(15_000L)
                                 if (macHint != null || config.bgMap.containsKey(FilterConfig.BG_ALL_KEY)) {
                                     decorateRoot(view, macHint, view.context.applicationContext)
-                                    applyFontColor(view)
+                                    applyFontColorForRoot(view)
                                 }
                             }
                         }
