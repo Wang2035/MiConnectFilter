@@ -1394,8 +1394,10 @@ class MiConnectModule : XposedModule() {
                                             val extras = notif.extras
                                             val cur = extras?.getCharSequence(Notification.EXTRA_TEXT)?.toString()
                                             if (cur != null) {
-                                                // 标明精确到部位：被补的那个值后面直接跟「断」
-                                                val nt = fillCardText(cur, t.first, t.second, t.third, config.batteryKeep)
+                                                // 标明精确到部位：被补的那个值后面直接跟「断」。
+                                                // 补值必标，只跟「断联电量显示」开关走；「全断联时保留电量」
+                                                // 只管整机断开时留不留卡，不管这里的标。
+                                                val nt = fillCardText(cur, t.first, t.second, t.third, true)
                                                 if (nt != cur) {
                                                     extras.putCharSequence(Notification.EXTRA_TEXT, nt)
                                                     lg("headset card text filled $mac -> ${nt.replace("\n", " / ")}")
