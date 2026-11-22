@@ -124,6 +124,26 @@ class MainActivity : Activity() {
             }
         }
 
+    /** 两行式开关行：标题 + 小字说明叠在左侧，开关在右侧，节奏与其它卡一致。 */
+    private fun switchRow(title: String, hint: String, sw: View): LinearLayout =
+        LinearLayout(this).apply {
+            orientation = LinearLayout.HORIZONTAL
+            gravity = Gravity.CENTER_VERTICAL
+            setPadding(0, dp(9), 0, dp(9))
+            val left = LinearLayout(this@MainActivity).apply {
+                orientation = LinearLayout.VERTICAL
+                layoutParams = LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.WRAP_CONTENT, 1f)
+                addView(txt(title, 16f, titleC))
+                addView(txt(hint, 13f, subC).apply {
+                    layoutParams = LinearLayout.LayoutParams(
+                        ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.WRAP_CONTENT,
+                    ).apply { topMargin = dp(2) }
+                })
+            }
+            addView(left)
+            addView(sw)
+        }
+
     private fun valueText(): TextView = txt("…", 14f, subC)
 
     private fun capsule(label: String, filled: Boolean): TextView = TextView(this).apply {
@@ -229,6 +249,8 @@ class MainActivity : Activity() {
         }.start()
     }
 
+    private var autoUpdateChecked = false
+
     override fun onResume() {
         super.onResume()
         refreshWhitelist()
@@ -237,6 +259,11 @@ class MainActivity : Activity() {
         syncAsync(showError = false)
         handler.removeCallbacks(ticker)
         handler.post(ticker)
+        if (!autoUpdateChecked) {
+            autoUpdateChecked = true
+            // 自动检查放在 onResume：onCreate 阶段弹的窗会被开场转场吞掉（一闪而过）
+            checkUpdate(auto = true)
+        }
     }
 
     override fun onPause() {
@@ -252,7 +279,7 @@ class MainActivity : Activity() {
             setPadding(dp(16), statusBarHeight() + dp(14), dp(16), dp(20))
             setBackgroundColor(Color.parseColor(bg))
         }
-        root.addView(txt("妙享快连过滤", 26f, titleC, bold = true))
+        root.addView(txt("妙享快连", 26f, titleC, bold = true))
         root.addView(txt("小米耳机弹窗白名单", 13f, subC).apply {
             layoutParams = LinearLayout.LayoutParams(
                 ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.WRAP_CONTENT,
@@ -280,65 +307,7 @@ class MainActivity : Activity() {
         statusCard.addView(restartBtn)
         root.addView(statusCard)
 
-        // 过滤
-        val ctlCard = card()
-        val enableSwitch = MiuixUi.MiuixSwitch(this, prefs.getBoolean("enabled", true)).apply {
-            onCheckedChange = { on ->
-                prefs.edit().putBoolean("enabled", on).apply()
-                syncAsync(showError = true)
-            }
-        }
-        ctlCard.addView(row("启用拦截", enableSwitch))
-        val debugSwitch = MiuixUi.MiuixSwitch(this, prefs.getBoolean("debug", false)).apply {
-            onCheckedChange = { on ->
-                prefs.edit().putBoolean("debug", on).apply()
-                syncAsync(showError = true)
-            }
-        }
-        ctlCard.addView(row("诊断日志", debugSwitch))
-        val diagBtn = capsule("查看日志", filled = false).apply {
-            setOnClickListener { showDiagLog() }
-        }
-        ctlCard.addView(diagBtn)
-        root.addView(ctlCard)
-
-        // 弹窗背景（可按设备分别设置）
-        val bgCard = card()
-        bgState = valueText(); bgCard.addView(row("弹窗背景", bgState))
-        bgBox = LinearLayout(this).apply { orientation = LinearLayout.VERTICAL }
-        bgCard.addView(bgBox)
-        val bgAddBtn = capsule("添加背景", filled = true).apply {
-            setOnClickListener { pickBgImage() }
-        }
-        bgCard.addView(bgAddBtn)
-        val pBar = android.widget.ProgressBar(
-            this, null, android.R.attr.progressBarStyleHorizontal,
-        ).apply {
-            max = 100
-            progressTintList =
-                android.content.res.ColorStateList.valueOf(Color.parseColor("#3482FF"))
-            layoutParams = LinearLayout.LayoutParams(
-                0, ViewGroup.LayoutParams.WRAP_CONTENT,
-            ).apply { weight = 1f }
-        }
-        val pText = txt("导入中…", 12.5f, subC).apply { setPadding(dp(10), 0, 0, 0) }
-        bgProgressBar = pBar
-        bgProgressText = pText
-        bgProgressRow = LinearLayout(this).apply {
-            orientation = LinearLayout.HORIZONTAL
-            gravity = android.view.Gravity.CENTER_VERTICAL
-            visibility = View.GONE
-            setPadding(0, dp(10), 0, dp(2))
-            addView(pBar)
-            addView(pText)
-        }
-        bgCard.addView(bgProgressRow)
-        bgCard.addView(txt("照片、动态图、视频都行（视频按原帧率播放）；点开已有背景可以修改播放方式、速度、显示区域和字体颜色（字体颜色只对这个背景的弹窗生效）。单独给某台耳机设的优先于全部设备。", 13f, subC).apply {
-            setPadding(0, dp(4), 0, dp(8))
-        })
-        root.addView(bgCard)
-
-        // 临时放行
+        // 临时放行（独立卡片，整体排在第 2 张）
         val bypassCard = card()
         bypassState = txt("拦截中", 16f, titleC)
         bypassCard.addView(row("临时放行", bypassState))
@@ -373,8 +342,68 @@ class MainActivity : Activity() {
         bypassCard.addView(bypassBtn)
         root.addView(bypassCard)
 
+        // 过滤
+        val ctlCard = card()
+        val batterySyncSwitch = MiuixUi.MiuixSwitch(this, prefs.getBoolean("battery_sync", true)).apply {
+            onCheckedChange = { on ->
+                prefs.edit().putBoolean("battery_sync", on).apply()
+                syncAsync(showError = true)
+            }
+        }
+        ctlCard.addView(switchRow("断联电量显示", "断开时把左/右/盒电量补进通知卡，补的值后标「断」。", batterySyncSwitch))
+        val batteryKeepSwitch = MiuixUi.MiuixSwitch(this, prefs.getBoolean("battery_keep", true)).apply {
+            onCheckedChange = { on ->
+                prefs.edit().putBoolean("battery_keep", on).apply()
+                syncAsync(showError = true)
+            }
+        }
+        ctlCard.addView(switchRow("全断联时保留电量", "全部断开后通知卡保留；关掉恢复原样。", batteryKeepSwitch))
+
+        // 弹窗背景（可按设备分别设置）
+        val bgCard = card()
+        bgState = valueText(); bgCard.addView(row("弹窗背景", bgState))
+        bgBox = LinearLayout(this).apply { orientation = LinearLayout.VERTICAL }
+        bgCard.addView(bgBox)
+        val bgAddBtn = capsule("添加背景", filled = true).apply {
+            setOnClickListener { pickBgImage() }
+        }
+        bgCard.addView(bgAddBtn)
+        val pBar = android.widget.ProgressBar(
+            this, null, android.R.attr.progressBarStyleHorizontal,
+        ).apply {
+            max = 100
+            progressTintList =
+                android.content.res.ColorStateList.valueOf(Color.parseColor("#3482FF"))
+            layoutParams = LinearLayout.LayoutParams(
+                0, ViewGroup.LayoutParams.WRAP_CONTENT,
+            ).apply { weight = 1f }
+        }
+        val pText = txt("导入中…", 12.5f, subC).apply { setPadding(dp(10), 0, 0, 0) }
+        bgProgressBar = pBar
+        bgProgressText = pText
+        bgProgressRow = LinearLayout(this).apply {
+            orientation = LinearLayout.HORIZONTAL
+            gravity = android.view.Gravity.CENTER_VERTICAL
+            visibility = View.GONE
+            setPadding(0, dp(10), 0, dp(2))
+            addView(pBar)
+            addView(pText)
+        }
+        bgCard.addView(bgProgressRow)
+        bgCard.addView(txt("照片、动图、视频都行；点开可改播放方式、速度、区域和字体颜色。单台耳机的优先于全部设备。", 13f, subC).apply {
+            setPadding(0, dp(4), 0, dp(8))
+        })
+        root.addView(bgCard)
+
         // 白名单
         val wlCard = card()
+        val enableSwitch = MiuixUi.MiuixSwitch(this, prefs.getBoolean("enabled", true)).apply {
+            onCheckedChange = { on ->
+                prefs.edit().putBoolean("enabled", on).apply()
+                syncAsync(showError = true)
+            }
+        }
+        wlCard.addView(row("启用拦截", enableSwitch))
         wlCount = txt("", 14f, subC)
         wlCard.addView(row("白名单", wlCount))
         wlBox = LinearLayout(this).apply { orientation = LinearLayout.VERTICAL }
@@ -389,8 +418,25 @@ class MainActivity : Activity() {
         wlCard.addView(manualBtn)
         root.addView(wlCard)
 
-        root.addView(txt("不在白名单的小米耳机弹窗都会拦，包括已配对的；先把自己的耳机加进白名单。", 13f, subC))
-        root.addView(txt("作用域用 LSPosed 推荐勾选（6 个全选）；改完点「重启作用域应用」。", 13f, subC))
+        wlCard.addView(txt("不在白名单的小米耳机弹窗都拦，包括已配对的。", 13f, subC).apply {
+            setPadding(0, dp(6), 0, dp(6))
+        })
+        root.addView(ctlCard)
+        // 日志（独立卡片，倒数第二张）
+        val diagCard = card()
+        val debugSwitch = MiuixUi.MiuixSwitch(this, prefs.getBoolean("debug", false)).apply {
+            onCheckedChange = { on ->
+                prefs.edit().putBoolean("debug", on).apply()
+                syncAsync(showError = true)
+            }
+        }
+        diagCard.addView(row("诊断日志", debugSwitch))
+        val diagBtn = capsule("查看日志", filled = false).apply {
+            setOnClickListener { showDiagLog() }
+        }
+        diagCard.addView(diagBtn)
+        root.addView(diagCard)
+
         // 关于：项目地址单独一栏（用户要求，不再放页脚小字）
         val aboutCard = card()
         val ghRow = row("项目地址", txt("›", 20f, subC))
@@ -407,6 +453,9 @@ class MainActivity : Activity() {
             }
         }
         aboutCard.addView(ghRow)
+        val updRow = row("检查更新", txt("›", 20f, subC))
+        updRow.setOnClickListener { checkUpdate(auto = false) }
+        aboutCard.addView(updRow)
         val verTxt = valueText()
         verTxt.text = try {
             packageManager.getPackageInfo(packageName, 0).versionName ?: ""
@@ -2129,7 +2178,7 @@ class MainActivity : Activity() {
         Thread {
             val results = RootUtil.restartScopeApps()
             val msg = results.joinToString("\n") { (pkg, state) ->
-                val label = Targets.LABELS[pkg] ?: pkg
+                val label = HookApps.LABELS[pkg] ?: pkg
                 when (state) {
                     "killed" -> "$label：已重启"
                     "not-running" -> "$label：未运行（下次启动生效）"
@@ -2160,20 +2209,24 @@ class MainActivity : Activity() {
             .append(" android=").append(RootUtil.getProp("ro.build.version.release")).append('\n')
         val v = ConfSync.currentValues(this)
         sb.append("settings: enabled=").append(v.enabled)
+            .append(" battery_sync=").append(v.batterySync)
+            .append(" battery_keep=").append(v.batteryKeep)
             .append(" debug=").append(v.debug)
             .append(" bg_map=").append(FilterConfig.renderBgMap(v.bgMap))
             .append(" bg_keys=").append(BgStore.keys(this).joinToString("+"))
             .append(" whitelist=").append(v.whitelist.sorted().joinToString(","))
             .append(" bypass_until=").append(v.bypassUntilMs)
             .append(" now=").append(System.currentTimeMillis()).append("\n\n")
-        val installedList = Targets.PACKAGES.sorted().joinToString(", ") { pkg ->
+        val installedList = HookApps.PACKAGES.sorted().joinToString(", ") { pkg ->
             val ok = try { packageManager.getPackageInfo(pkg, 0); true } catch (_: Throwable) { false }
             "$pkg=${if (ok) "installed" else "missing"}"
         }
         sb.append("targets: ").append(installedList).append("\n\n")
         val (_, conf) = RootUtil.execSu("cat ${ConfSync.CONF_PATH} 2>/dev/null; ls -l ${ConfSync.CONF_PATH} 2>&1")
         sb.append("== conf file ==\n").append(conf).append("\n\n")
-        val (_, lc) = RootUtil.execSu("logcat -d -s MiConnectFilter:* 2>/dev/null | tail -n 300")
+        val (_, ps) = RootUtil.execSu("ps -A -o PID,NAME 2>/dev/null | grep -E 'bluetooth|settings|earphone|milink|mi_connect' | head -30")
+        sb.append("== processes ==\n").append(ps).append("\n\n")
+        val (_, lc) = RootUtil.execSu("logcat -d -s MiConnectFilter:* 2>/dev/null | tail -n 800")
         sb.append("== logcat (MiConnectFilter) ==\n").append(lc).append("\n\n")
         val (_, tl) = RootUtil.execSu("tail -n 200 ${ConfSync.LOG_PATH} 2>/dev/null")
         sb.append("== decision log file ==\n").append(tl).append('\n')
@@ -2227,7 +2280,7 @@ class MainActivity : Activity() {
         Thread {
             val root = RootUtil.checkRoot()
             val lsp = if (root) RootUtil.checkLspd() else false
-            val installed = Targets.PACKAGES.count { pkg ->
+            val installed = HookApps.PACKAGES.count { pkg ->
                 try { packageManager.getPackageInfo(pkg, 0); true } catch (_: Throwable) { false }
             }
             val miOs = RootUtil.getProp("ro.mi.os.version.name")
@@ -2241,7 +2294,7 @@ class MainActivity : Activity() {
                     androidVer.isNotEmpty() -> "Android $androidVer"
                     else -> "未知"
                 }
-                vTargets.text = "已装 $installed/${Targets.PACKAGES.size}"
+                vTargets.text = "已装 $installed/${HookApps.PACKAGES.size}"
             }
         }.start()
     }
@@ -2250,6 +2303,144 @@ class MainActivity : Activity() {
         Thread {
             val ok = ConfSync.sync(this)
             if (!ok && showError) runOnUiThread { toast("同步失败：需要 Root 授权") }
+        }.start()
+    }
+
+    // ------------------------------------------------------------ 检查更新（GitHub Releases）
+
+    private fun currentVersionName(): String = try {
+        packageManager.getPackageInfo(packageName, 0).versionName ?: ""
+    } catch (_: Throwable) {
+        ""
+    }
+
+    /** 点分数字逐段比较：a 比 b 新返回 1，旧返回 -1，一样返回 0。 */
+    private fun compareVersions(a: String, b: String): Int {
+        val pa = a.split('.').map { it.toIntOrNull() ?: 0 }
+        val pb = b.split('.').map { it.toIntOrNull() ?: 0 }
+        for (i in 0 until maxOf(pa.size, pb.size)) {
+            val x = pa.getOrElse(i) { 0 }
+            val y = pb.getOrElse(i) { 0 }
+            if (x != y) return if (x > y) 1 else -1
+        }
+        return 0
+    }
+
+    /**
+     * 查 GitHub 仓库最新 Release。auto=true 是打开应用时自动查：1 小时内查过就跳过，
+     * 有新版才弹窗，没有或失败都静默；手动点「检查更新」则无论结果都给反馈。
+     */
+    @Volatile private var updateCheckRunning = false
+    @Volatile private var updateCheckManual = false
+    private var updateSpinner: android.app.Dialog? = null
+
+    private fun showUpdateSpinner() {
+        if (updateSpinner != null) return
+        val bar = android.widget.ProgressBar(this).apply {
+            isIndeterminate = true
+            layoutParams = LinearLayout.LayoutParams(dp(36), dp(36)).apply {
+                gravity = Gravity.CENTER_HORIZONTAL
+                topMargin = dp(8)
+                bottomMargin = dp(4)
+            }
+        }
+        updateSpinner = MiuixUi.showDialog(
+            this,
+            title = "检查更新",
+            message = null,
+            content = bar,
+            positiveText = null,
+            negativeText = null,
+        ).apply { setCancelable(false) }
+    }
+
+    private fun dismissUpdateSpinner() {
+        try { updateSpinner?.dismiss() } catch (_: Throwable) {}
+        updateSpinner = null
+    }
+
+    private fun checkUpdate(auto: Boolean) {
+        val now = System.currentTimeMillis()
+        if (auto && now - prefs.getLong("update_checked_at", 0L) < 3_600_000L) return
+        synchronized(this) {
+            if (updateCheckRunning) {
+                // 已有检查在跑（多半是打开应用时的自动检查）：手动点击并到那次上，
+                // 结果只出一个弹窗，避免两个弹窗叠加闪烁
+                if (!auto) {
+                    updateCheckManual = true
+                    showUpdateSpinner()
+                }
+                return
+            }
+            updateCheckRunning = true
+            updateCheckManual = !auto
+        }
+        prefs.edit().putLong("update_checked_at", now).apply()
+        if (!auto) showUpdateSpinner()
+        Thread {
+            var latest: String? = null
+            var notes: String? = null
+            var pageUrl: String? = null
+            try {
+                val conn = java.net.URL(
+                    "https://api.github.com/repos/Wang2035/MiConnectFilter/releases/latest",
+                ).openConnection() as java.net.HttpURLConnection
+                conn.connectTimeout = 8000
+                conn.readTimeout = 8000
+                conn.setRequestProperty("User-Agent", "MiaoXiangKuaiLian-Android")
+                conn.setRequestProperty("Accept", "application/vnd.github+json")
+                val text = conn.inputStream.bufferedReader().readText()
+                val json = org.json.JSONObject(text)
+                latest = json.optString("tag_name").trim().removePrefix("v").removePrefix("V")
+                notes = json.optString("body")
+                pageUrl = json.optString("html_url")
+            } catch (_: Throwable) {
+                latest = null
+            }
+            val cur = currentVersionName()
+            val lat = latest
+            runOnUiThread {
+                synchronized(this) { updateCheckRunning = false }
+                dismissUpdateSpinner()
+                val manual = updateCheckManual
+                if (isFinishing || isDestroyed) return@runOnUiThread
+                if (lat.isNullOrBlank()) {
+                    if (manual) toast("检查更新失败，请稍后再试")
+                } else if (compareVersions(lat, cur) > 0) {
+                    val msg = StringBuilder("最新版本 v$lat（当前 v$cur）")
+                    val n = notes?.trim().orEmpty()
+                    if (n.isNotEmpty()) {
+                        msg.append("\n\n").append(if (n.length > 600) n.substring(0, 600) + "…" else n)
+                    }
+                    val url = pageUrl
+                        ?: "https://github.com/Wang2035/MiConnectFilter/releases/latest"
+                    window.decorView.post {
+                        if (isFinishing || isDestroyed) return@post
+                        val dlg = MiuixUi.showDialog(
+                            this,
+                            title = "发现新版本",
+                            message = msg.toString(),
+                            positiveText = "去下载",
+                            negativeText = "以后再说",
+                            onPositive = {
+                                try {
+                                    startActivity(
+                                        android.content.Intent(
+                                            android.content.Intent.ACTION_VIEW,
+                                            android.net.Uri.parse(url),
+                                        ),
+                                    )
+                                } catch (_: Throwable) {
+                                    toast("没有可用的浏览器")
+                                }
+                            },
+                        )
+                        dlg.setCanceledOnTouchOutside(false)
+                    }
+                } else if (manual) {
+                    toast("已是最新版本（v$cur）")
+                }
+            }
         }.start()
     }
 

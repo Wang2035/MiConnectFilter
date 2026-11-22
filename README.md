@@ -4,7 +4,7 @@
 
 ## 中文
 
-LSPosed（Zygote）模块，过滤小米耳机「妙享快连」发现弹窗：只放行白名单里的耳机，其它小米耳机的弹窗一律拦截。在 KernelSU + LSPosed 环境下、澎湃 OS 3 / Android 16 实测可用；澎湃 OS 4 / Android 17 已适配（v1.34 起，待实测）。
+LSPosed（Zygote）模块，过滤小米耳机「妙享快连」发现弹窗：只放行白名单里的耳机，其它小米耳机的弹窗一律拦截。在 KernelSU + LSPosed 环境下、澎湃 OS 3 / Android 16 与澎湃 OS 4 / Android 17 均实测可用。
 
 包名：`io.github.wang2035.miconnectfilter`（v1.20 起由 com.miconnect.filter 改名，以满足 LSPosed 仓库的包名归属要求；旧包名版本需卸载后重装，白名单需重新添加。）
 
@@ -15,24 +15,26 @@ LSPosed（Zygote）模块，过滤小米耳机「妙享快连」发现弹窗：�
 - **名称同步**：读取系统蓝牙别名，在系统里给耳机改过名后，白名单里的名称会自动更新。
 - **弹窗背景**：可给全部设备或某台耳机单独设置弹窗卡片背景，支持照片、动态图（GIF / 动态 WebP）、动态照片与视频（在本应用内按原帧率抽帧后送到弹窗播放）；播放模式（循环 / 播一次停在最后一帧 / 往返）、播放速度、显示区域都可调，背景设置里可按当前设置直接播放预览。
 - **弹窗字体颜色**：每张背景单独设置——系统（跟随系统深色/浅色模式）/ 白字 / 黑字三档，只对贴了该背景的弹窗生效，配合背景图保证文字看得清。
+- **断联电量显示**：耳机断开后，通知栏的耳机通知卡保留左/右/盒三值电量；单耳或充电盒单独断开时，把缺的那部分电量补进卡片并在值后标「断」，整机断开时卡片也不被系统移除。可在设置页开关（「断联电量显示」与「全断联时保留电量」）。
+- **检查更新**：打开应用时自动查 GitHub 最新 Release，有新版才弹窗；设置页也可手动检查。
 - **诊断日志**：可开关；关着时模块零日志输出。开着时记录每个弹窗事件的进程、入口、设备 MAC、判定与原因，可在设置页查看/清除/导出。
 - **不禁用 MiLink、不停服务、不做全局通知拦截**：只在目标进程内逐条判定带设备信息的弹窗与通知。
 
 ### 环境要求
 
-- Android 16 / 澎湃 OS 3（实测）；Android 17 / 澎湃 OS 4（已适配，待实测）。框架需支持 libxposed API 102 与 Android 17（如 LSPosed 2.x / Vector 2.1+）
+- Android 16 / 澎湃 OS 3、Android 17 / 澎湃 OS 4（均实测）。框架需支持 libxposed API 102 与 Android 17（如 LSPosed 2.x / Vector 2.1+）
 - KernelSU（或其它 Root 方案）+ LSPosed 2.x（libxposed API 101+）
 
 ### 使用
 
-1. 安装 APK，在 LSPosed 中启用模块，作用域用「推荐」全选（6 个：蓝牙、设备互联、蓝牙扩展等）。
+1. 安装 APK，在 LSPosed 中启用模块，作用域用「推荐」全选（4 个）。
 2. 点设置页「重启作用域应用」，或直接重启手机。
 3. 在设置页把**自己的耳机先加进白名单**（可从已配对列表添加），否则严格模式会连自家耳机的开盖弹窗一起拦。
 4. 需要配对新耳机时，用「临时放行」暂停拦截几分钟。
 
 ### 配置是怎么送达系统进程的
 
-蓝牙域系统进程被 SELinux 挡住、读不到 `/data/local/tmp` 的配置文件，因此配置走三路冗余：文件 + 广播直发（`ConfigBus`）+ 进程启动时主动拉取，并落盘到各目标应用的私有目录缓存；进程每 60 秒自动重拉一次，改设置不必重启进程。
+蓝牙域系统进程被 SELinux 挡住、读不到 `/data/local/tmp` 的配置文件，因此配置走三路冗余：文件 + 广播直发（`ConfigBus`）+ 进程启动时主动拉取，并落盘到各目标应用的私有目录缓存；改设置靠广播实时推送，进程拿到配置后不再周期重拉（省电），改设置不必重启进程。
 
 ### 构建
 
@@ -46,7 +48,7 @@ LSPosed（Zygote）模块，过滤小米耳机「妙享快连」发现弹窗：�
 
 ## English
 
-An LSPosed (Zygote) module that filters Xiaomi earbuds' "Mi Connect" fast-pair popups: only whitelisted earbuds may pop up; every other Xiaomi earbud's popup is blocked. Tested on HyperOS 3 / Android 16 with KernelSU + LSPosed; HyperOS 4 / Android 17 supported since v1.34 (pending on-device verification).
+An LSPosed (Zygote) module that filters Xiaomi earbuds' "Mi Connect" fast-pair popups: only whitelisted earbuds may pop up; every other Xiaomi earbud's popup is blocked. Tested on HyperOS 3 / Android 16 and HyperOS 4 / Android 17 with KernelSU + LSPosed.
 
 Package: `io.github.wang2035.miconnectfilter` (renamed from com.miconnect.filter in v1.20 to meet the LSPosed repository's package-ownership rules; uninstall the old package first, then re-add your whitelist.)
 
@@ -57,24 +59,26 @@ Package: `io.github.wang2035.miconnectfilter` (renamed from com.miconnect.filter
 - **Name sync**: reads the system Bluetooth alias, so renamed earbuds get their new name in the whitelist automatically.
 - **Popup background**: set a card background for all devices or per earbud — photos, animated images (GIF / animated WebP), motion photos and videos (videos are frame-extracted at their native frame rate inside the app, then played in the popup); play mode (loop / once, stop on last frame / ping-pong), speed and crop region are adjustable, and the settings sheet can play a live preview with the current settings.
 - **Popup font color**: set per background — System (follows the system dark/light mode) / white / black; applies only to popups showing that background, so text stays readable.
+- **Disconnect battery display**: after the earbuds disconnect, the notification-center headset card keeps the left / right / case battery levels; when a single bud or the case disconnects on its own, the missing value is filled in and marked with 「断」 right after it, and on full disconnect the card is kept instead of being removed. Toggleable in settings ("Disconnect battery display" and "Keep on full disconnect").
+- **Update check**: on launch the app checks the latest GitHub Release and only pops up when a newer version exists; a manual check is available in settings.
 - **Diagnostic logging**: optional; when off, the module emits no logs at all. When on, every popup event is recorded with process, entry point, device MAC, decision and reason, viewable / clearable / exportable in the settings page.
 - **No MiLink disabling, no service killing, no global notification blocking**: decisions are made per popup/notification carrying device info, inside the target processes only.
 
 ### Requirements
 
-- Android 16 / HyperOS 3 (tested); Android 17 / HyperOS 4 (supported since v1.34, pending on-device verification). The framework must support libxposed API 102 on Android 17 (e.g. LSPosed 2.x / Vector 2.1+)
+- Android 16 / HyperOS 3 and Android 17 / HyperOS 4 (both tested). The framework must support libxposed API 102 on Android 17 (e.g. LSPosed 2.x / Vector 2.1+)
 - KernelSU (or another root solution) + LSPosed 2.x (libxposed API 101+)
 
 ### Usage
 
-1. Install the APK, enable the module in LSPosed, and select all recommended scope apps (6: Bluetooth, MiLink, Bluetooth extensions, etc.).
+1. Install the APK, enable the module in LSPosed, and select all recommended scope apps (4).
 2. Tap "Restart scope apps" in settings, or reboot the phone.
 3. **Add your own earbuds to the whitelist first** (you can pick from paired devices) — strict mode otherwise blocks their lid-open popup too.
 4. Use the temporary bypass when pairing a new device.
 
 ### How config reaches system processes
 
-Bluetooth-domain system processes cannot read the config file in `/data/local/tmp` (SELinux), so config is delivered redundantly: file + direct broadcast (`ConfigBus`) + an active pull at process start, cached in each target app's private directory; processes re-pull every 60 seconds, so settings take effect without restarts.
+Bluetooth-domain system processes cannot read the config file in `/data/local/tmp` (SELinux), so config is delivered redundantly: file + direct broadcast (`ConfigBus`) + an active pull at process start, cached in each target app's private directory; changes are pushed live by broadcast and a process that already holds its config does not re-pull periodically (power saving), so settings take effect without restarts.
 
 ### Build
 

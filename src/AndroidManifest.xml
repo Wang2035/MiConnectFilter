@@ -1,8 +1,8 @@
 <?xml version="1.0" encoding="utf-8"?>
 <manifest xmlns:android="http://schemas.android.com/apk/res/android"
     package="io.github.wang2035.miconnectfilter"
-    android:versionCode="52"
-    android:versionName="1.51">
+    android:versionCode="86"
+    android:versionName="1.85">
 
     <uses-sdk
         android:minSdkVersion="27"
@@ -12,9 +12,10 @@
     <uses-permission android:name="android.permission.BLUETOOTH_CONNECT" />
     <uses-permission android:name="android.permission.QUERY_ALL_PACKAGES" />
     <uses-permission android:name="android.permission.RECEIVE_BOOT_COMPLETED" />
+    <uses-permission android:name="android.permission.INTERNET" />
 
     <application
-        android:label="妙享快连过滤"
+        android:label="妙享快连"
         android:icon="@mipmap/ic_launcher"
         android:theme="@android:style/Theme.Material.NoActionBar">
         <activity
@@ -40,6 +41,13 @@
             </intent-filter>
         </receiver>
         <receiver
+            android:name=".BatterySyncReceiver"
+            android:exported="true">
+            <intent-filter>
+                <action android:name="io.github.wang2035.miconnectfilter.action.BATTERY_SYNC" />
+            </intent-filter>
+        </receiver>
+        <receiver
             android:name=".BootResyncReceiver"
             android:exported="true">
             <intent-filter>
@@ -52,7 +60,7 @@
             android:value="true" />
         <meta-data
             android:name="xposeddescription"
-            android:value="HyperOS MiConnect (com.miui.connectionshare) fast-connect popup filter: MAC whitelist for Xiaomi earbuds, paired devices always allowed, 5-min temporary bypass for adding new devices" />
+            android:value="HyperOS fast-connect popup filter: MAC whitelist for Xiaomi earbuds, paired devices always allowed, 5-min temporary bypass for adding new devices" />
         <meta-data
             android:name="xposedminversion"
             android:value="101" />

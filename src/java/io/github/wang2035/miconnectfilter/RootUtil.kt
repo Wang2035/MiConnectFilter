@@ -67,7 +67,7 @@ object RootUtil {
      * killed / not-running / failed。
      */
     fun restartScopeApps(): List<Pair<String, String>> {
-        val pkgs = Targets.PACKAGES.sorted()
+        val pkgs = HookApps.PACKAGES.sorted()
         val script = StringBuilder()
         for (pkg in pkgs) {
             script.append("pid=\$(pidof $pkg 2>/dev/null); ")
@@ -164,6 +164,10 @@ object ConfSync {
             bgMap = BgStore.versionMap(ctx),
             bgOpts = BgStore.optsMap(ctx),
             fontColor = p.getInt("font_color", 0),
+            battery = BatteryStore.map(ctx),
+            batterySync = p.getBoolean("battery_sync", true),
+            battery3 = BatteryStore.map3(ctx),
+            batteryKeep = p.getBoolean("battery_keep", true),
         )
     }
 
@@ -178,6 +182,10 @@ object ConfSync {
             bgMap = BgStore.versionMap(ctx),
             bgOpts = BgStore.optsMap(ctx),
             fontColor = p.getInt("font_color", 0),
+            battery = BatteryStore.map(ctx),
+            batterySync = p.getBoolean("battery_sync", true),
+            battery3 = BatteryStore.map3(ctx),
+            batteryKeep = p.getBoolean("battery_keep", true),
         )
     }
 
@@ -189,18 +197,20 @@ object ConfSync {
     @Volatile private var lastBcSig: String? = null
     @Volatile private var lastBcAt: Long = 0L
 
-    fun sendConfigBroadcast(ctx: Context) {
+    fun sendConfigBroadcast(ctx: Context, force: Boolean = false) {
         try {
             val v = currentValues(ctx)
             val wlCsv = v.whitelist.sorted().joinToString(",")
             val bgCsv = FilterConfig.renderBgMap(v.bgMap)
             val bgOptsCsv = BgOpt.renderMap(v.bgOpts)
+            val batteryCsv = FilterConfig.renderBatteryMap(v.battery)
+            val battery3Csv = FilterConfig.renderBattery3Map(v.battery3)
             // 去重：内容一字未变且 10 秒内刚广播过就跳过。每次 sync 都十二连发，
             // 各目标进程被反复唤醒处理同一份配置（广播风暴），弹窗路径也跟着受累；
             // 新起的进程有主动拉取 + 私有缓存兜底，不靠这波重复广播。
-            val sig = "${v.enabled}|$wlCsv|${v.bypassUntilMs}|${v.debug}|$bgCsv|$bgOptsCsv|${v.fontColor}"
+            val sig = "${v.enabled}|$wlCsv|${v.bypassUntilMs}|${v.debug}|$bgCsv|$bgOptsCsv|${v.fontColor}|$batteryCsv|${v.batterySync}|$battery3Csv|${v.batteryKeep}"
             val nowMs = System.currentTimeMillis()
-            if (sig == lastBcSig && nowMs - lastBcAt < 10_000L) return
+            if (!force && sig == lastBcSig && nowMs - lastBcAt < 10_000L) return
             lastBcSig = sig
             lastBcAt = nowMs
             for (pkg in Targets.PACKAGES) {
@@ -214,6 +224,10 @@ object ConfSync {
                     putExtra("bg_map", bgCsv)
                     putExtra("bg_opts", bgOptsCsv)
                     putExtra("font_color", v.fontColor)
+                    putExtra("battery", batteryCsv)
+                    putExtra("battery_sync", v.batterySync)
+                    putExtra("battery3", battery3Csv)
+                    putExtra("battery_keep", v.batteryKeep)
                 }
                 ctx.sendBroadcast(intent)
             }
@@ -230,13 +244,40 @@ object ConfSync {
                     .append(" --es bg_map '").append(bgCsv).append("'")
                     .append(" --es bg_opts '").append(bgOptsCsv).append("'")
                     .append(" --ei font_color ").append(v.fontColor)
+                    .append(" --es battery '").append(batteryCsv).append("'")
+                    .append(" --ez battery_sync ").append(if (v.batterySync) "true" else "false")
+                    .append(" --es battery3 '").append(battery3Csv).append("'")
+                    .append(" --ez battery_keep ").append(if (v.batteryKeep) "true" else "false")
             }
             Thread { RootUtil.execSu(am.toString()) }.start()
         } catch (_: Throwable) {}
     }
 
+    /** 给单个（用户自行加进作用域的）包定向发一份当前配置：电量注入要在那些进程里生效。 */
+    fun sendConfigBroadcastTo(ctx: Context, pkg: String) {
+        try {
+            val v = currentValues(ctx)
+            val intent = Intent(ConfigBus.ACTION).apply {
+                setPackage(pkg)
+                putExtra("token", ConfigBus.TOKEN)
+                putExtra("enabled", v.enabled)
+                putExtra("whitelist", v.whitelist.sorted().joinToString(","))
+                putExtra("bypass_until", v.bypassUntilMs)
+                putExtra("debug", v.debug)
+                putExtra("bg_map", FilterConfig.renderBgMap(v.bgMap))
+                putExtra("bg_opts", BgOpt.renderMap(v.bgOpts))
+                putExtra("font_color", v.fontColor)
+                putExtra("battery", FilterConfig.renderBatteryMap(v.battery))
+                putExtra("battery_sync", v.batterySync)
+                putExtra("battery3", FilterConfig.renderBattery3Map(v.battery3))
+                putExtra("battery_keep", v.batteryKeep)
+            }
+            ctx.sendBroadcast(intent)
+        } catch (_: Throwable) {}
+    }
+
     /** 双通道同步：文件（普通进程读）+ 广播（系统进程内存收）。 */
-    fun sync(ctx: Context): Boolean {
+    fun sync(ctx: Context, force: Boolean = false): Boolean {
         val fileOk = try {
             val tmp = File(ctx.cacheDir, "miconnectfilter.conf")
             tmp.writeText(buildConf(ctx))
@@ -247,7 +288,7 @@ object ConfSync {
         } catch (_: Throwable) {
             false
         }
-        sendConfigBroadcast(ctx)
+        sendConfigBroadcast(ctx, force)
         return fileOk
     }
 }
@@ -257,6 +298,52 @@ object ConfSync {
  * 没有别名才用原始广播名。此前只读 name，改过名的设备在应用里一直显示旧名、
  * 白名单里存的备注也永远不更新。
  */
+/**
+ * 框架电量存档（设置页进程持有）：蓝牙进程里的 hook 读到 BluetoothDevice 电量后
+ * 广播回传到这里，落 prefs 并经配置通道同步给全部进程；断联后各进程注入读数时用。
+ * 应用内不显示（用户要求），这里只存值。
+ */
+object BatteryStore {
+    private const val KEY = "battery_map"
+
+    /** key 形式 MAC（去分隔符大写）-> 电量（0-100）。 */
+    fun map(ctx: Context): Map<String, Int> =
+        FilterConfig.parseBatteryMap(ConfSync.prefs(ctx).getString(KEY, ""))
+
+    private const val KEY3 = "battery3_map"
+
+    /** key 形式 MAC -> "左,右,盒"。 */
+    fun map3(ctx: Context): Map<String, String> =
+        FilterConfig.parseBattery3Map(ConfSync.prefs(ctx).getString(KEY3, "") ?: "")
+
+    /** 写入一台设备的最新三值；值没变返回 false。 */
+    fun update3(ctx: Context, mac: String, tripleCsv: String): Boolean {
+        val key = MacUtil.keyOf(mac) ?: return false
+        val parsed = FilterConfig.parseBattery3Map("$key:$tripleCsv")
+        val norm = parsed[key] ?: return false
+        val p = ConfSync.prefs(ctx)
+        val cur = FilterConfig.parseBattery3Map(p.getString(KEY3, "") ?: "")
+        if (cur[key] == norm) return false
+        val next = LinkedHashMap(cur)
+        next[key] = norm
+        p.edit().putString(KEY3, FilterConfig.renderBattery3Map(next)).apply()
+        return true
+    }
+
+    /** 写入一台设备的最新电量；值没变返回 false（调用方就不必再同步一轮）。 */
+    fun update(ctx: Context, mac: String, level: Int): Boolean {
+        val key = MacUtil.keyOf(mac) ?: return false
+        if (level !in 0..100) return false
+        val p = ConfSync.prefs(ctx)
+        val cur = FilterConfig.parseBatteryMap(p.getString(KEY, ""))
+        if (cur[key] == level) return false
+        val next = LinkedHashMap(cur)
+        next[key] = level
+        p.edit().putString(KEY, FilterConfig.renderBatteryMap(next)).apply()
+        return true
+    }
+}
+
 object DeviceNames {
     fun displayName(dev: android.bluetooth.BluetoothDevice): String? {
         val alias = try {

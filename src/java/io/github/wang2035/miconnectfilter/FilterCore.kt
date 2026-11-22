@@ -3,7 +3,7 @@ package io.github.wang2035.miconnectfilter
 import java.io.File
 
 /**
- * 妙享快连过滤 - 纯逻辑核心（无 Android 依赖，可 JVM 单测）。
+ * 妙享快连 - 纯逻辑核心（无 Android 依赖，可 JVM 单测）。
  *
  * 判定原则（按顺序，命中即返回）：
  *  1) 模块未启用 -> PASS（不干预）
@@ -105,8 +105,24 @@ data class FilterConfig(
     val bgOpts: Map<String, BgOpt> = emptyMap(),
     /** 弹窗字体颜色：0=系统（跟随系统深色/浅色，不改） 1=白字 2=黑字。 */
     val fontColor: Int = 0,
+    /** 最后捕获的框架电量：key = MAC 去分隔符大写，value = 0-100。断联后框架读不到电量时用它顶。 */
+    val battery: Map<String, Int> = emptyMap(),
+    /** 电量同步总开关（默认开）：捕获、框架注入、断联保住三值缓存都受它控制，关了全部停。 */
+    val batterySync: Boolean = true,
+    /** 最后捕获的三值电量：key = MAC 去分隔符大写，value = "左,右,盒"（每值 0-100）。
+     *  同步到蓝牙栈进程后写进蓝牙框架（AdapterService.storeDeviceBattery）。 */
+    val battery3: Map<String, String> = emptyMap(),
+    /** 全断联（耳机全回仓关盖）后依旧显示断联时电量（默认开）：关了则全断联时恢复原样，
+     *  框架与缓存的清除不再拦截、框架也不再写入、显示标明停。受 batterySync 前提控制。 */
+    val batteryKeep: Boolean = true,
 ) {
     fun isBypassActive(nowMs: Long): Boolean = bypassUntilMs > nowMs
+
+    /** 这台设备最后捕获的框架电量；没捕获过返回 null。 */
+    fun batteryLevelFor(mac: String?): Int? = MacUtil.keyOf(mac)?.let { battery[it] }
+
+    /** 这台设备最后捕获的三值电量 "左,右,盒"；没捕获过返回 null。 */
+    fun battery3For(mac: String?): String? = MacUtil.keyOf(mac)?.let { battery3[it] }
 
     /** 某张背景图的选项（没设过用默认：循环、原速、居中填满）。 */
     fun bgOptFor(key: String): BgOpt = bgOpts[key] ?: BgOpt.DEFAULT
@@ -151,6 +167,66 @@ data class FilterConfig(
                 .sortedBy { it.key }
                 .joinToString(",") { "${it.key}:${it.value}" }
 
+        /** "AABBCC112233:85,..." <-> 电量表（key 同 bg_map 的设备 key）。 */
+        fun parseBatteryMap(text: String?): Map<String, Int> {
+            if (text.isNullOrBlank()) return emptyMap()
+            val out = LinkedHashMap<String, Int>()
+            for (part in text.split(',', ';', ' ')) {
+                val p = part.trim()
+                if (p.isEmpty()) continue
+                val i = p.lastIndexOf(':')
+                if (i <= 0) continue
+                val key = p.substring(0, i).trim().uppercase()
+                if (!key.matches(Regex("^[0-9A-F]{12}$"))) continue
+                val v = p.substring(i + 1).toIntOrNull() ?: continue
+                if (v in 0..100) out[key] = v
+            }
+            return out
+        }
+
+        fun renderBatteryMap(map: Map<String, Int>): String =
+            map.entries.sortedBy { it.key }.joinToString(",") { "${it.key}:${it.value}" }
+
+        /** 三值电量表文本形式：KEY12:左,右,盒;KEY12:左,右,盒（每值 0-100，非法条目丢弃）。 */
+        fun parseBattery3Map(csv: String): Map<String, String> {
+            if (csv.isBlank()) return emptyMap()
+            val out = LinkedHashMap<String, String>()
+            for (part in csv.split(';')) {
+                val kv = part.split(':', limit = 2)
+                if (kv.size != 2) continue
+                val key = kv[0].trim().uppercase()
+                val nums = kv[1].split(',').mapNotNull { it.trim().toIntOrNull() }
+                if (key.length == 12 && key.all { it.isDigit() || it in 'A'..'F' } &&
+                    nums.size == 3 && nums.all { it in 0..100 }
+                ) {
+                    out[key] = nums.joinToString(",")
+                }
+            }
+            return out
+        }
+
+        fun renderBattery3Map(map: Map<String, String>): String =
+            map.entries.sortedBy { it.key }.joinToString(";") { "${it.key}:${it.value}" }
+
+        /** 框架 storeDeviceBattery 的电量串：左/右/盒各两位十六进制（百分值），非法返回 null。 */
+        /** 三值派生的框架单值：左右取较小者（0 视为缺失、忽略），向上取整到十位，
+         *  与框架 AdapterService.getLeAudioBatteryLevel 的规则一致；解析不了返回 null。 */
+        fun battery3DerivedLevel(csv: String?): Int? {
+            if (csv.isNullOrBlank()) return null
+            val parts = csv.split(',').mapNotNull { it.trim().toIntOrNull() }
+            if (parts.size < 2) return null
+            val present = listOf(parts[0], parts[1]).filter { it > 0 }
+            if (present.isEmpty()) return null
+            val base = present.min()
+            return ((base + 9) / 10 * 10).coerceAtMost(100)
+        }
+
+        fun battery3Hex(csv: String): String? {
+            val nums = csv.split(',').mapNotNull { it.trim().toIntOrNull() }
+            if (nums.size != 3 || nums.any { it !in 0..100 }) return null
+            return nums.joinToString("") { "%02x".format(it) }
+        }
+
         fun parse(text: String): FilterConfig {
             var enabled = true
             var wl: Set<String> = emptySet()
@@ -159,6 +235,10 @@ data class FilterConfig(
             var bgMap: Map<String, Long> = emptyMap()
             var bgOpts: Map<String, BgOpt> = emptyMap()
             var fontColor = 0
+            var battery: Map<String, Int> = emptyMap()
+            var batterySync = true
+            var batteryKeep = true
+            var battery3: Map<String, String> = emptyMap()
             for (raw in text.lineSequence()) {
                 val line = raw.trim()
                 if (line.isEmpty() || line.startsWith("#")) continue
@@ -175,6 +255,10 @@ data class FilterConfig(
                     "bg_map" -> bgMap = parseBgMap(value)
                     "bg_opts" -> bgOpts = BgOpt.parseMap(value)
                     "font_color" -> fontColor = (value.toIntOrNull() ?: 0).coerceIn(0, 2)
+                    "battery" -> battery = parseBatteryMap(value)
+                    "battery_sync" -> batterySync = (value == "1" || value.equals("true", true))
+                    "battery_keep" -> batteryKeep = (value == "1" || value.equals("true", true))
+                    "battery3" -> battery3 = parseBattery3Map(value)
                     // v1.21 的单图写法，读到就当「全部设备」
                     "bg_version" -> {
                         val v = value.toLongOrNull() ?: 0L
@@ -182,11 +266,11 @@ data class FilterConfig(
                     }
                 }
             }
-            return FilterConfig(enabled, wl, bypass, debug, bgMap, bgOpts, fontColor)
+            return FilterConfig(enabled, wl, bypass, debug, bgMap, bgOpts, fontColor, battery, batterySync, battery3, batteryKeep)
         }
 
         /** 广播通道用的构造：入参来自 Intent extras，已在 UI 侧算好。 */
-        fun of(enabled: Boolean, whitelistCsv: String, bypassUntilMs: Long, debug: Boolean, bgMapCsv: String = "", bgOptsCsv: String = "", fontColor: Int = 0): FilterConfig =
+        fun of(enabled: Boolean, whitelistCsv: String, bypassUntilMs: Long, debug: Boolean, bgMapCsv: String = "", bgOptsCsv: String = "", fontColor: Int = 0, batteryCsv: String = "", batterySync: Boolean = true, battery3Csv: String = "", batteryKeep: Boolean = true): FilterConfig =
             FilterConfig(
                 enabled = enabled,
                 whitelist = whitelistCsv.split(',', ';', ' ')
@@ -196,6 +280,10 @@ data class FilterConfig(
                 bgMap = parseBgMap(bgMapCsv),
                 bgOpts = BgOpt.parseMap(bgOptsCsv),
                 fontColor = fontColor.coerceIn(0, 2),
+                battery = parseBatteryMap(batteryCsv),
+                batterySync = batterySync,
+                battery3 = parseBattery3Map(battery3Csv),
+                batteryKeep = batteryKeep,
             )
 
         fun load(file: File): FilterConfig = try {
@@ -204,7 +292,7 @@ data class FilterConfig(
             FilterConfig()
         }
 
-        fun render(enabled: Boolean, whitelist: Set<String>, bypassUntilMs: Long, debug: Boolean, bgMap: Map<String, Long> = emptyMap(), bgOpts: Map<String, BgOpt> = emptyMap(), fontColor: Int = 0): String {
+        fun render(enabled: Boolean, whitelist: Set<String>, bypassUntilMs: Long, debug: Boolean, bgMap: Map<String, Long> = emptyMap(), bgOpts: Map<String, BgOpt> = emptyMap(), fontColor: Int = 0, battery: Map<String, Int> = emptyMap(), batterySync: Boolean = true, battery3: Map<String, String> = emptyMap(), batteryKeep: Boolean = true): String {
             val sb = StringBuilder()
             sb.append("# miconnectfilter conf v1\n")
             sb.append("enabled=").append(if (enabled) "1" else "0").append('\n')
@@ -216,6 +304,10 @@ data class FilterConfig(
             sb.append("bg_map=").append(renderBgMap(bgMap)).append('\n')
             sb.append("bg_opts=").append(BgOpt.renderMap(bgOpts)).append('\n')
             sb.append("font_color=").append(fontColor.coerceIn(0, 2)).append('\n')
+            sb.append("battery=").append(renderBatteryMap(battery)).append('\n')
+            sb.append("battery_sync=").append(if (batterySync) "1" else "0").append('\n')
+            sb.append("battery3=").append(renderBattery3Map(battery3)).append('\n')
+            sb.append("battery_keep=").append(if (batteryKeep) "1" else "0").append('\n')
             return sb.toString()
         }
     }
@@ -229,6 +321,7 @@ data class FilterConfig(
 object ConfigBus {
     const val ACTION = "io.github.wang2035.miconnectfilter.action.CONFIG_SYNC"
     const val REQUEST_ACTION = "io.github.wang2035.miconnectfilter.action.CONFIG_REQUEST"
+    const val BATTERY_ACTION = "io.github.wang2035.miconnectfilter.action.BATTERY_SYNC"
     const val TOKEN = "mcf-cfg-v1"
     const val MODULE_PACKAGE = "io.github.wang2035.miconnectfilter"
 
@@ -381,7 +474,6 @@ object FilterCore {
 
 /**
  * 目标包（LSPosed 推荐作用域与 hook 生效范围一致）：
- *  - com.miui.connectionshare：用户指定，HyperOS 妙享/通信共享侧弹窗入口
  *  - com.milink.service：澎湃 OS 3 的「设备互联」主体（17.x），OS3 起
  *    HyperConnect 的设备发现/弹窗可能由它拉起；判定逻辑完全相同——
  *    只按耳机设备信息逐条判定，它的互传/妙享桌面等流程不带耳机信息、
@@ -389,14 +481,12 @@ object FilterCore {
  */
 object Targets {
     val PACKAGES: Set<String> = setOf(
-        // 用户指定 + OS3 设备互联主体
-        "com.miui.connectionshare",
+        // OS3 设备互联主体
         "com.milink.service",
         // 备选（v1.2 追加）：实测弹窗不在上面两个进程里时，最可能的宿主——
         // 蓝牙扩展与蓝牙栈才是耳机发现广播/快连弹窗的实际处理方
         // （同类模块 HyperEars 的必选作用域就是 com.android.bluetooth + com.milink.service，
         //   连接弹窗还需 com.xiaomi.bluetooth；MiuiBluetooth 的弹窗决策也在该包内）
-        "com.miui.bluetoothext",
         "com.xiaomi.bluetooth",
         "com.android.bluetooth",
         "com.xiaomi.mi_connect_service",
@@ -404,16 +494,22 @@ object Targets {
 
     /** 推荐作用域 = 全部支持包。v1.7 曾精简为 4 个，结果把真实弹窗宿主
      * （通信共享）挤出了推荐，用户重勾后模块根本没注入，日志全空、拦截失效；
-     * v1.11 起恢复全量推荐，不再精简。 */
+     * v1.11 起恢复全量推荐，不再精简。2026-11-22 按用户要求删掉 OS4 上
+     * 不存在的两个包（通信共享、MIUI 蓝牙扩展 com.miui.bluetoothext）。 */
     val RECOMMENDED: Set<String> = PACKAGES
 
     /** 友好名，供设置页状态汇总。 */
     val LABELS: Map<String, String> = mapOf(
-        "com.miui.connectionshare" to "通信共享/妙享",
         "com.milink.service" to "设备互联 MiLink",
-        "com.miui.bluetoothext" to "蓝牙扩展",
         "com.xiaomi.bluetooth" to "MIUI 蓝牙扩展",
         "com.android.bluetooth" to "蓝牙栈",
         "com.xiaomi.mi_connect_service" to "小米互联服务",
     )
+}
+
+/** 需要 hook 的应用全集：过滤目标 4 个 + 显示标明要用的「设置」与「小米耳机」。
+ *  重启作用域、已装统计、LSPosed 推荐作用域都按这份名单；过滤层仍只进 Targets。 */
+object HookApps {
+    val PACKAGES: Set<String> = Targets.PACKAGES
+    val LABELS: Map<String, String> = Targets.LABELS
 }

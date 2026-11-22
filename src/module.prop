@@ -1,5 +1,5 @@
 name=MiConnectFilter
 author=miconnect
-description=HyperOS 3/4 (Android 16/17) fast-connect popup filter: strict earbud MAC whitelist across connectionshare, MiLink, Bluetooth extension/stack processes; non-whitelisted Xiaomi earbuds blocked, paired or not; 5-min temporary bypass; per-device popup backgrounds and font color
+description=HyperOS 3/4 (Android 16/17) fast-connect popup filter: strict earbud MAC whitelist across MiLink, Bluetooth extension/stack processes; non-whitelisted Xiaomi earbuds blocked, paired or not; 5-min temporary bypass; per-device popup backgrounds and font color
 minApiVersion=101
 targetApiVersion=102

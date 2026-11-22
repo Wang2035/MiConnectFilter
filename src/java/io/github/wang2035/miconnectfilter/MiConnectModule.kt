@@ -2,6 +2,8 @@ package io.github.wang2035.miconnectfilter
 
 import android.app.Activity
 import android.app.Notification
+import android.bluetooth.BluetoothAdapter
+import android.bluetooth.BluetoothDevice
 import android.content.BroadcastReceiver
 import android.content.Context
 import android.content.Intent
@@ -42,7 +44,7 @@ import java.util.WeakHashMap
 import java.util.concurrent.ConcurrentHashMap
 
 /**
- * 妙享快连过滤（LSPosed / libxposed API 101-102，Zygote 注入）。
+ * 妙享快连（LSPosed / libxposed API 101-102，Zygote 注入）。
  *
  * 作用域只有 com.miui.connectionshare 一个进程（scope.list 已限定，
  * onPackageReady 里再做一次硬校验，勾错也不会影响任何其它应用）。
@@ -880,7 +882,6 @@ class MiConnectModule : XposedModule() {
 
     override fun onPackageReady(param: XposedModuleInterface.PackageReadyParam) {
         try {
-            if (param.packageName !in TARGETS) return
             if (!param.isFirstPackage) return
             if (hooked) return
             hooked = true
@@ -888,6 +889,16 @@ class MiConnectModule : XposedModule() {
             refreshConfig(force = true)
             ensureConfigBus()
             val cl = param.classLoader
+            if (param.packageName == "com.xiaomi.bluetooth") {
+                hookSaveLastBattery(cl)
+                hookNotificationCancel(cl)
+                hookHeadsetCardText(cl)
+            }
+            if (param.packageName !in TARGETS) {
+                // 不在过滤目标内的进程：只留配置通道，过滤层不进
+                lg("battery-only hooks in ${param.packageName}")
+                return
+            }
             hookStartActivity(cl)
             hookNotifications(cl)
             hookActivityOnCreate(cl)
@@ -1051,6 +1062,10 @@ class MiConnectModule : XposedModule() {
                             bgMapCsv = intent.getStringExtra("bg_map") ?: "",
                             bgOptsCsv = intent.getStringExtra("bg_opts") ?: "",
                             fontColor = intent.getIntExtra("font_color", 0),
+                            batteryCsv = intent.getStringExtra("battery") ?: "",
+                            batterySync = intent.getBooleanExtra("battery_sync", true),
+                            battery3Csv = intent.getStringExtra("battery3") ?: "",
+                            batteryKeep = intent.getBooleanExtra("battery_keep", true),
                         )
                         busConfig = cfg
                         config = cfg
@@ -1062,7 +1077,7 @@ class MiConnectModule : XposedModule() {
                             val ctx = appContext
                             if (ctx != null) {
                                 File(ctx.filesDir, "miconnectfilter.conf").writeText(
-                                    FilterConfig.render(cfg.enabled, cfg.whitelist, cfg.bypassUntilMs, cfg.debug, cfg.bgMap, cfg.bgOpts, cfg.fontColor),
+                                    FilterConfig.render(cfg.enabled, cfg.whitelist, cfg.bypassUntilMs, cfg.debug, cfg.bgMap, cfg.bgOpts, cfg.fontColor, cfg.battery, cfg.batterySync, cfg.battery3, cfg.batteryKeep),
                                 )
                             }
                         } catch (_: Throwable) {}
@@ -1107,6 +1122,7 @@ class MiConnectModule : XposedModule() {
             val req = Intent(ConfigBus.REQUEST_ACTION).apply {
                 setPackage(ConfigBus.MODULE_PACKAGE)
                 putExtra("token", ConfigBus.TOKEN)
+                putExtra("from", targetPackage)
             }
             app.sendBroadcast(req)
             lg("config pull requested")
@@ -1120,6 +1136,9 @@ class MiConnectModule : XposedModule() {
      */
     private fun maybeRePull() {
         if (!busRegistered) return
+        // 已拿到配置（广播推送或私有缓存）就不再周期拉取：变更都靠广播即时推送，
+        // 周期拉取只会每分钟把设置页进程唤醒一次（省电）。还没配置的进程才继续拉。
+        if (busConfig != null) return
         val app = appContext ?: return
         val now = SystemClock.elapsedRealtime()
         if (now - lastPullMs > 60_000) sendPullRequest(app)
@@ -1142,14 +1161,22 @@ class MiConnectModule : XposedModule() {
             })
     }
 
+    @Volatile private var lastDecideRefreshMs = 0L
+
     private fun decide(probe: Probe, site: String): Decision {
-        refreshConfig()
+        // 配置靠广播推送即时更新；判定路径里的 refresh 只是兜底愈合，5 秒节流，
+        // 避免蓝牙广播密集时每个广播都跑一遍配置读取（省电）。
+        val nowRt = SystemClock.elapsedRealtime()
+        if (nowRt - lastDecideRefreshMs > 5_000) {
+            lastDecideRefreshMs = nowRt
+            refreshConfig()
+        }
         remember(probe)
         val (d, reason) = FilterCore.decideWithReason(config, probe, System.currentTimeMillis())
         // 弹窗事件全量采集（带设备信息的才记）：进程/入口/设备/判定/原因/当时配置，
         // 同一条 5 秒去重。排查时看导出的 logcat 即可，不用猜。
         val hasDevice = probe.mac != null || probe.deviceName != null || probe.xiaomiEarbud
-        if (hasDevice) {
+        if (hasDevice && config.debug) {
             val key = "$site|${probe.mac}|${probe.deviceName}|$d"
             val now = System.currentTimeMillis()
             val last = lastEvent[key] ?: 0L
@@ -1206,6 +1233,238 @@ class MiConnectModule : XposedModule() {
     private fun intentArg(args: List<Any?>): Intent? =
         args.firstOrNull { it is Intent } as? Intent
 
+    // ------------------------------------------------------------ 三值电量：保住小米自己的缓存
+    //
+    // 蓝牙扩展的耳机服务把左/右/盒三值缓存在 DeviceIdCached 的
+    // BATTERY_LEVEL_CACHED_CONFIG<MAC> 里（写入点 FragmentHandler.saveLastBattery），
+    // 耳机 app、通知、离线查找都读它；但设备断开 MMA 连接时服务会以 clear=true
+    // 调 saveLastBattery 把缓存删掉，断联后电量消失就是这么来的。这里只拦白名单
+    // 设备的清除调用，写入原样放行：不轮询、不自存、零额外功耗。
+    // 受 config.batterySync 控制，关了不拦（系统恢复原样删除）。
+
+    private fun hookSaveLastBattery(cl: ClassLoader) {
+        hookAll(cl, "com.android.bluetooth.ble.app.headset.FragmentHandler",
+            { m -> m.name == "saveLastBattery" && m.parameterTypes.size == 3 },
+            {
+                object : XposedInterface.Hooker {
+                    override fun intercept(chain: XposedInterface.Chain): Any? {
+                        try {
+                            if (config.batterySync && chain.args.getOrNull(2) != true) {
+                                val devW = chain.args.getOrNull(1) as? BluetoothDevice
+                                val macW = try { devW?.address } catch (_: Throwable) { null }
+                                val normW = MacUtil.normalize(macW)
+                                val strW = chain.args.getOrNull(0) as? String
+                                if (normW != null && strW != null && config.whitelist.contains(normW)) {
+                                    reportTriple(normW, strW)
+                                }
+                            }
+                            if (config.batterySync && config.batteryKeep && chain.args.getOrNull(2) == true) {
+                                val dev = chain.args.getOrNull(1) as? BluetoothDevice
+                                val mac = try { dev?.address } catch (_: Throwable) { null }
+                                val norm = MacUtil.normalize(mac)
+                                if (norm != null && config.whitelist.contains(norm)) {
+                                    lg("battery cache clear vetoed for $norm")
+                                    reportDisconnect(norm)
+                                    return null
+                                }
+                            }
+                        } catch (_: Throwable) {}
+                        return chain.proceed(chain.args.toTypedArray())
+                    }
+                }
+            })
+    }
+
+    private val lastTripleSent = HashMap<String, String>()
+
+    /** 断联信号（扩展进程拦下缓存清除时发出）：设置页收到后强制同步一轮，
+     *  蓝牙栈进程据此检查框架存电表、被清掉就重写，治断开清理绕过拦截的情况。 */
+    private fun reportDisconnect(mac: String) {
+        try {
+            val app = appContext ?: return
+            val intent = Intent(ConfigBus.BATTERY_ACTION).apply {
+                setPackage(ConfigBus.MODULE_PACKAGE)
+                putExtra("token", ConfigBus.TOKEN)
+                putExtra("mac", mac)
+                putExtra("disc", true)
+            }
+            app.sendBroadcast(intent)
+            lg("battery disconnect reported $mac")
+        } catch (_: Throwable) {}
+    }
+
+    /** 耳机服务写入缓存的三值回传设置页落盘，再经配置通道同步到蓝牙栈进程写进框架。 */
+    private fun reportTriple(mac: String?, tripleCsv: String) {
+        if (!config.batterySync) return
+        val norm = MacUtil.normalize(mac) ?: return
+        val nums = tripleCsv.split(',').mapNotNull { it.trim().toIntOrNull()?.and(0x7F) }
+        if (nums.size != 3 || nums.any { it !in 0..100 }) return
+        val csv = nums.joinToString(",")
+        synchronized(lastTripleSent) {
+            if (lastTripleSent[norm] == csv) return
+            lastTripleSent[norm] = csv
+        }
+        try {
+            val key = MacUtil.keyOf(norm)
+            if (key != null && config.battery3[key] != csv) {
+                val next = LinkedHashMap(config.battery3)
+                next[key] = csv
+                config = config.copy(battery3 = next)
+            }
+        } catch (_: Throwable) {}
+        try {
+            val app = appContext ?: return
+            val intent = Intent(ConfigBus.BATTERY_ACTION).apply {
+                setPackage(ConfigBus.MODULE_PACKAGE)
+                putExtra("token", ConfigBus.TOKEN)
+                putExtra("mac", norm)
+                putExtra("triple", csv)
+            }
+            app.sendBroadcast(intent)
+            lg("battery3 report $norm=$csv")
+        } catch (_: Throwable) {}
+    }
+
+    // ------------------------------------------------------------ 标明是断联时电量
+    //
+    // 框架的存电表只有数值、没有「断联时」标记位，标明只能落在显示层：
+    // 1) 断开瞬间的那条提示（灵动岛/焦点通知）：正文后拼上断联时三值；
+    // 2) 设置蓝牙列表页（需用户把 com.android.settings 加进作用域）：设备已断开、
+    //    但框架里还留着它的三值时，在该设备摘要后加「（断联时电量）」。
+    // 两处都只改显示文字，不动框架里的数。
+
+    private fun readCachedTriple(mac: String): Triple<Int, Int, Int>? {
+        return try {
+            val ctx = appContext ?: return null
+            val sp = ctx.getSharedPreferences("DeviceIdCached", 4)
+            val raw = sp.getString("BATTERY_LEVEL_CACHED_CONFIG" + mac, null) ?: return null
+            val parts = raw.split(',').mapNotNull { it.trim().toIntOrNull()?.and(0x7F) }
+            if (parts.size != 3 || parts.any { it !in 0..100 }) null
+            else Triple(parts[0], parts[1], parts[2])
+        } catch (_: Throwable) { null }
+    }
+
+    /** 取消被拦下的同一刻，把存好的卡原件正文加上「（断联时）」重发一次：
+     *  卡是连接时发出的、之后不再更新，不在取消时刻重发就永远没机会标明。 */
+    private fun remarkCard(nmObj: Any?, tag: String, id: Int) {
+        try {
+            val notif = lastCardByTag[tag] ?: run {
+                lg("headset card remark skipped: no stash for $tag")
+                return
+            }
+            val extras = notif.extras ?: return
+            val cur = extras.getCharSequence(Notification.EXTRA_TEXT)?.toString() ?: return
+            // 全部断联：三个值都是断联时电量，逐个值后标明（已标的跳过）
+            var nt = Regex("""(\d+%)(?!断)""").replace(cur) { it.groupValues[1] + "断" }
+            if (nt == cur) {
+                if (cur.contains("断")) return
+                nt = cur + "断"
+            }
+            extras.putCharSequence(Notification.EXTRA_TEXT, nt)
+            val nm = nmObj as? android.app.NotificationManager ?: return
+            nm.notify(tag, id, notif)
+            lg("headset card remarked tag=$tag")
+        } catch (e: Throwable) {
+            lg("headset card remark failed: $e")
+        }
+    }
+
+    /** 耳机连接卡（tag=BTHeadset<MAC>）的正文由扩展 headset.n 拼装：没连上的
+     *  部分（在仓里的耳、仓本身）一律填「-」。在 notify 出口把正文里的「-」
+     *  按顺序（盒、左、右）换成保住的三值；已断开时再加「（断联时）」。
+     *  这样单耳在外、双耳在外、全部断开三种状态卡上都是完整三值。 */
+    /** 最近一次发出的耳机卡原件（按 tag 存）：断开取消被拦时用它重发一份带标明的。 */
+    private val lastCardByTag = HashMap<String, Notification>()
+
+    private fun hookHeadsetCardText(cl: ClassLoader) {
+        hookAll(cl, "android.app.NotificationManager",
+            { m -> m.name == "notify" || m.name == "notifyAsUser" || m.name == "notifyAsPackage" },
+            {
+                object : XposedInterface.Hooker {
+                    override fun intercept(chain: XposedInterface.Chain): Any? {
+                        try {
+                            if (config.batterySync) {
+                                val tag = chain.args.firstOrNull { it is String } as? String
+                                val notif = chain.args.firstOrNull { it is Notification } as? Notification
+                                if (tag != null && notif != null && tag.startsWith("BTHeadset")) {
+                                    val mac = MacUtil.normalize(tag.removePrefix("BTHeadset"))
+                                    if (mac != null && config.whitelist.contains(mac)) {
+                                        val t = readCachedTriple(mac) ?: parseTripleCsv(config.battery3For(mac))
+                                        if (t != null) {
+                                            val extras = notif.extras
+                                            val cur = extras?.getCharSequence(Notification.EXTRA_TEXT)?.toString()
+                                            if (cur != null) {
+                                                // 标明精确到部位：被补的那个值后面直接跟「断」
+                                                val nt = fillCardText(cur, t.first, t.second, t.third, config.batteryKeep)
+                                                if (nt != cur) {
+                                                    extras.putCharSequence(Notification.EXTRA_TEXT, nt)
+                                                    lg("headset card text filled $mac -> ${nt.replace("\n", " / ")}")
+                                                }
+                                                lastCardByTag[tag] = notif
+                                            }
+                                        }
+                                    }
+                                }
+                            }
+                        } catch (_: Throwable) {}
+                        return chain.proceed(chain.args.toTypedArray())
+                    }
+                }
+            })
+    }
+
+    /** 卡正文里「：-」按出现顺序是盒、左、右，只补空缺，真实值不覆盖。 */
+    private fun fillCardText(text: String, l: Int, r: Int, b: Int, mark: Boolean = false): String {
+        val suffix = if (mark) "断" else ""
+        val vals = listOf("$b%" + suffix, "$l%" + suffix, "$r%" + suffix)
+        var idx = 0
+        val sb = StringBuilder()
+        var i = 0
+        while (i < text.length) {
+            if (idx < 3 && text.startsWith("：-", i)) {
+                sb.append("：").append(vals[idx])
+                idx++
+                i += 2
+            } else {
+                sb.append(text[i])
+                i++
+            }
+        }
+        return sb.toString()
+    }
+
+    private fun parseTripleCsv(csv: String?): Triple<Int, Int, Int>? {
+        if (csv.isNullOrBlank()) return null
+        val parts = csv.split(',').mapNotNull { it.trim().toIntOrNull() }
+        return if (parts.size == 3) Triple(parts[0], parts[1], parts[2]) else null
+    }
+
+    private fun hookNotificationCancel(cl: ClassLoader) {
+        hookAll(cl, "android.app.NotificationManager",
+            { m -> m.name == "cancel" || m.name == "cancelAsUser" || m.name == "cancelAll" },
+            {
+                object : XposedInterface.Hooker {
+                    override fun intercept(chain: XposedInterface.Chain): Any? {
+                        try {
+                            val tag = chain.args.firstOrNull { it is String } as? String
+                            val id = chain.args.firstOrNull { it is Int } as? Int
+                            val headset = tag != null && (tag.contains("BTHeadset") ||
+                                config.whitelist.any { tag.contains(it) })
+                            lg("notify cancel seen tag=$tag id=$id headset=$headset")
+                            if (headset && chain.args.isNotEmpty() &&
+                                config.batterySync && config.batteryKeep
+                            ) {
+                                lg("notify cancel vetoed tag=$tag id=$id")
+                                if (tag != null && id != null) remarkCard(chain.thisObject, tag, id)
+                                return null
+                            }
+                        } catch (_: Throwable) {}
+                        return chain.proceed(chain.args.toTypedArray())
+                    }
+                }
+            })
+    }
+
     // ------------------------------------------------------------ layer 1: startActivity
 
     private fun hookStartActivity(cl: ClassLoader) {
@@ -1242,6 +1501,30 @@ class MiConnectModule : XposedModule() {
         hookAll(cl, "android.content.ContextWrapper", filter, mk)
         hookAll(cl, "android.app.ContextImpl", filter, mk)
         hookAll(cl, "android.app.Activity", filter, mk)
+    }
+
+    /** 电量探针（仅 debug）：把弹窗 intent 的全部 extras 打进日志，定位电量字段的位置。 */
+    private fun dumpIntentExtras(intent: Intent) {
+        try {
+            val cls = intent.component?.className ?: intent.action ?: "?"
+            val extras = intent.extras
+            if (extras == null) {
+                lg("intentprobe $cls extras=null")
+                return
+            }
+            val sb = StringBuilder("intentprobe $cls extras:")
+            for (k in extras.keySet()) {
+                val v = try { extras.get(k) } catch (_: Throwable) { null }
+                val s = when (v) {
+                    is ByteArray -> "hex:" + v.joinToString("") { "%02x".format(it) }.take(440)
+                    is IntArray -> v.joinToString(",", "[", "]")
+                    is Array<*> -> v.joinToString(",", "[", "]") { it?.toString() ?: "null" }
+                    else -> v?.toString()?.replace('\n', ' ')?.take(800) ?: "null"
+                }
+                sb.append("\n  ").append(k).append('=').append(s)
+            }
+            lg(sb.toString().take(6000))
+        } catch (_: Throwable) {}
     }
 
     // ------------------------------------------------------------ layer 2: notifications (per-device, not global)
@@ -1444,6 +1727,15 @@ class MiConnectModule : XposedModule() {
                             if (self != null) {
                                 val ordered = findFieldValue(self, "mCurOrdered") as? Boolean ?: false
                                 val intent = findFieldValue(self, "mCurIntent") as? Intent
+                                if (config.debug && intent != null) {
+                                    val act = intent.action ?: ""
+                                    if (act.contains("bluetooth", true) &&
+                                        (act.contains("ACL") || act.contains("CONNECTION_STATE") ||
+                                            act.contains("BATTERY"))
+                                    ) {
+                                        dumpIntentExtras(intent)
+                                    }
+                                }
                                 if (!ordered && intent != null) {
                                     val raw = DeviceProbe.fromIntent(intent, sitePopup = false)
                                     if ((raw.mac != null || raw.deviceName != null) && raw.xiaomiEarbud) {
@@ -1540,7 +1832,7 @@ class MiConnectModule : XposedModule() {
                                                     try {
                                                         val r = chain.args.getOrNull(1) as? android.bluetooth.le.ScanResult
                                                         val probe = DeviceProbe.fromScanResult(r)
-                                                        if ((probe.mac != null || probe.deviceName != null) &&
+if ((probe.mac != null || probe.deviceName != null) &&
                                                             decide(probe, "scanResult") == Decision.BLOCK
                                                         ) {
                                                             return null
@@ -1587,7 +1879,7 @@ class MiConnectModule : XposedModule() {
                             var any = false
                             for (m in cls.declaredMethods) {
                                 val mn = m.name.lowercase()
-                                if (!(mn.contains("show") || mn.contains("popup") || mn.contains("dialog") ||
+if (!(mn.contains("show") || mn.contains("popup") || mn.contains("dialog") ||
                                         mn.contains("toast") || mn.contains("notify") || mn.contains("display"))
                                 ) continue
                                 try {

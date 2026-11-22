@@ -105,15 +105,15 @@ fun main() {
     check("name null no", !FilterCore.isXiaomiEarbudName(null))
 
     // --- targets (OS3 adaptation + recommended scope) ---
-    check("target connectionshare", Targets.PACKAGES.contains("com.miui.connectionshare"))
+    check("target connectionshare removed (OS4 absent)", !Targets.PACKAGES.contains("com.miui.connectionshare"))
     check("target milink (OS3 interconnect)", Targets.PACKAGES.contains("com.milink.service"))
-    check("target bluetoothext", Targets.PACKAGES.contains("com.miui.bluetoothext"))
+    check("target bluetoothext removed (OS4 absent)", !Targets.PACKAGES.contains("com.miui.bluetoothext"))
     check("target xiaomi.bluetooth", Targets.PACKAGES.contains("com.xiaomi.bluetooth"))
     check("target android.bluetooth", Targets.PACKAGES.contains("com.android.bluetooth"))
     check("target mi_connect_service", Targets.PACKAGES.contains("com.xiaomi.mi_connect_service"))
-    check("targets exactly 6", Targets.PACKAGES.size == 6)
+    check("targets exactly 4", Targets.PACKAGES.size == 4)
     check("labels for all targets", Targets.LABELS.keys == Targets.PACKAGES)
-    check("recommended is all supported", Targets.RECOMMENDED == Targets.PACKAGES && Targets.RECOMMENDED.size == 6)
+    check("recommended is all supported", Targets.RECOMMENDED == Targets.PACKAGES && Targets.RECOMMENDED.size == 4)
     check("recommended subset of supported", Targets.PACKAGES.containsAll(Targets.RECOMMENDED))
     check("target does not include system framework", !Targets.PACKAGES.contains("android"))
 
