@@ -1266,7 +1266,7 @@ class MiConnectModule : XposedModule() {
                                 if (norm != null && config.whitelist.contains(norm)) {
                                     lg("battery cache clear vetoed for $norm")
                                     // 整机断开瞬间：把卡上最后显示的三值存下来（比缓存新）
-                                    snapshotTriple(norm, null, readCardStash(cl, dev))
+                                    snapshotTriple(norm, null, lastSeenTriple[norm])
                                     reportDisconnect(norm)
                                     return null
                                 }
@@ -1281,19 +1281,14 @@ class MiConnectModule : XposedModule() {
     // ------------------------------------------------------------ 断开瞬间抓三值
     //
     // 连接期间的实时电量（MMA 上报）只喂通知卡、不写 DeviceIdCached 缓存，
-    // 所以缓存里的三值会停在连接初期，戴着耗掉的电跟不上。通知卡类自己存了
-    // 一份「最后一次显示的三值」（静态方法 g 取），那是实时上报喂的、最新。
-    // 这里只在断开事件读它一次：某只耳机刚回盒（卡重发时该位由有效变失效）
-    // 或整机断开（缓存清除被拦下时）。不持续抓、不轮询。
+    // 所以缓存里的三值会停在连接初期，戴着耗掉的电跟不上。卡上最后显示的
+    // 三值才是实时的，但系统自己的那份存货（headset.n 的静态表）在断开
+    // 清理时会被它自己删掉（n.d -> m 移除条目），等缓存清除被拦下时去读
+    // 已经空了——v1.87 就栽在这。所以模块在内存里自留一份卡上刚显示的
+    // 三值（只在内存，不落盘、不广播、不耗电），只在断开事件把它存下来：
+    // 某只耳机刚回盒（卡重发时该位由有效变失效）或整机断开（清除被拦下时）。
 
-    private fun readCardStash(cl: ClassLoader, dev: BluetoothDevice?): IntArray? {
-        if (dev == null) return null
-        return try {
-            val cls = Class.forName("com.android.bluetooth.ble.app.headset.n", false, cl)
-            val m = cls.getMethod("g", BluetoothDevice::class.java)
-            (m.invoke(null, dev) as? IntArray)?.takeIf { it.size == 3 }
-        } catch (_: Throwable) { null }
-    }
+    private val lastSeenTriple = HashMap<String, IntArray>()
 
     private fun slotVal(v: Int): Int? {
         val m = v and 0x7F
@@ -1317,8 +1312,8 @@ class MiConnectModule : XposedModule() {
         reportTriple(mac, out.joinToString(","))
     }
 
-    /** 通知卡每次重发都经过 n.a(..., iArr, ...)：平时不抓，只在一只耳机的值
-     *  由有效变失效（刚回盒）这一刻，把断开前显示的三值存下来。 */
+    /** 通知卡每次重发都经过 n.a(..., iArr, ...)：内存里留一份刚显示的三值，
+     *  只在一只耳机的值由有效变失效（刚回盒）这一刻把断开前的三值存下来。 */
     private fun hookCardPoster(cl: ClassLoader) {
         hookAll(cl, "com.android.bluetooth.ble.app.headset.n",
             { m -> m.name == "a" && m.parameterTypes.size == 5 },
@@ -1332,14 +1327,15 @@ class MiConnectModule : XposedModule() {
                                 val incoming = chain.args.getOrNull(2) as? IntArray
                                 if (dev != null && norm != null && incoming != null && incoming.size == 3 &&
                                     config.whitelist.contains(norm)) {
-                                    val stash = readCardStash(cl, dev)
-                                    if (stash != null) {
+                                    val prev = lastSeenTriple[norm]
+                                    if (prev != null) {
                                         var dropped = false
                                         for (i in 0..2) {
-                                            if (slotVal(stash[i]) != null && slotVal(incoming[i]) == null) dropped = true
+                                            if (slotVal(prev[i]) != null && slotVal(incoming[i]) == null) dropped = true
                                         }
-                                        if (dropped) snapshotTriple(norm, incoming, stash)
+                                        if (dropped) snapshotTriple(norm, incoming, prev)
                                     }
+                                    lastSeenTriple[norm] = incoming.copyOf()
                                 }
                             }
                         } catch (_: Throwable) {}
@@ -1490,24 +1486,17 @@ class MiConnectModule : XposedModule() {
             })
     }
 
-    /** 卡正文里「：-」按出现顺序是盒、左、右，只补空缺，真实值不覆盖。 */
+    /** 只补空缺，真实值不覆盖。必须按标签对位补，不能按「：-」的出现顺序：
+     *  缺的位不一定是盒/左/右的前缀组合（比如只缺盒和右时，按顺序补会把
+     *  左的值填进右——2026-11-23 日志实证：右耳被填了左耳的 100 而非自己的 95）。
+     *  三个标签在正文里各出现一次，锚定替换即可。 */
     private fun fillCardText(text: String, l: Int, r: Int, b: Int, mark: Boolean = false): String {
         val suffix = if (mark) "断" else ""
-        val vals = listOf("$b%" + suffix, "$l%" + suffix, "$r%" + suffix)
-        var idx = 0
-        val sb = StringBuilder()
-        var i = 0
-        while (i < text.length) {
-            if (idx < 3 && text.startsWith("：-", i)) {
-                sb.append("：").append(vals[idx])
-                idx++
-                i += 2
-            } else {
-                sb.append(text[i])
-                i++
-            }
-        }
-        return sb.toString()
+        var out = text
+        out = out.replace("充电盒：-", "充电盒：" + b + "%" + suffix)
+        out = out.replace("左：-", "左：" + l + "%" + suffix)
+        out = out.replace("右：-", "右：" + r + "%" + suffix)
+        return out
     }
 
     private fun parseTripleCsv(csv: String?): Triple<Int, Int, Int>? {
