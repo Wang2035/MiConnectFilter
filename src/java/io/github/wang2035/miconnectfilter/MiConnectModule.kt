@@ -87,6 +87,7 @@ class MiConnectModule : XposedModule() {
     @Volatile private var configSource: String = "default"
     @Volatile private var pullSent = false
     @Volatile private var lastPullMs = 0L
+    @Volatile private var pullCount = 0
 
     /** 事件采集去重：同 site+设备+判定 5 秒内只记一条，防扫描回调刷屏。 */
     private val lastEvent = ConcurrentHashMap<String, Long>()
@@ -1071,7 +1072,7 @@ class MiConnectModule : XposedModule() {
                         busConfig = cfg
                         config = cfg
                         configSource = "broadcast"
-                        lg("config via broadcast: enabled=${cfg.enabled} wl=${cfg.whitelist.size} bypass_until=${cfg.bypassUntilMs}")
+                        lg("config via broadcast: enabled=${cfg.enabled} wl=${cfg.whitelist.size} bypass_until=${cfg.bypassUntilMs} battery3=${cfg.battery3}")
                         log("CONFIG", null, "via broadcast bypass_until=${cfg.bypassUntilMs} wl=${cfg.whitelist.size}")
                         // 落盘到目标应用私有目录，下次该进程重启直接读缓存，不依赖谁再发广播
                         try {
@@ -1119,6 +1120,7 @@ class MiConnectModule : XposedModule() {
 
     private fun sendPullRequest(app: Context) {
         lastPullMs = SystemClock.elapsedRealtime()
+        pullCount++
         try {
             val req = Intent(ConfigBus.REQUEST_ACTION).apply {
                 setPackage(ConfigBus.MODULE_PACKAGE)
@@ -1140,6 +1142,9 @@ class MiConnectModule : XposedModule() {
         // 已拿到配置（广播推送或私有缓存）就不再周期拉取：变更都靠广播即时推送，
         // 周期拉取只会每分钟把设置页进程唤醒一次（省电）。还没配置的进程才继续拉。
         if (busConfig != null) return
+        // 一直拿不到配置的进程最多拉 12 次（约 12 分钟）就停，
+        // 别每分钟唤醒一次设置页进程没完没了（省电）
+        if (pullCount >= 12) return
         val app = appContext ?: return
         val now = SystemClock.elapsedRealtime()
         if (now - lastPullMs > 60_000) sendPullRequest(app)
@@ -1256,6 +1261,7 @@ class MiConnectModule : XposedModule() {
                                 val normW = MacUtil.normalize(macW)
                                 val strW = chain.args.getOrNull(0) as? String
                                 if (normW != null && strW != null && config.whitelist.contains(normW)) {
+                                    lg("batt write raw $normW str=$strW")
                                     reportTriple(normW, strW)
                                 }
                             }
@@ -1290,6 +1296,10 @@ class MiConnectModule : XposedModule() {
 
     private val lastSeenTriple = HashMap<String, IntArray>()
 
+    /** 开盖窗口（毫秒，elapsedRealtime）：某位耳机/盒从断开变回连接（开盖）
+     *  时开窗 30 秒，窗口内卡重发的新值才并入记录；平时佩戴不抓。 */
+    private val openSessionUntil = HashMap<String, Long>()
+
     private fun slotVal(v: Int): Int? {
         val m = v and 0x7F
         return if (v != 255 && m in 0..100) m else null
@@ -1309,7 +1319,29 @@ class MiConnectModule : XposedModule() {
             if (v == null) return
             out[i] = v
         }
+        lg("batt snapshot $mac fresh=${fresh?.joinToString(",")} seen=${stash?.joinToString(",")} -> ${out.joinToString(",")}")
         reportTriple(mac, out.joinToString(","))
+    }
+
+    /** 卡重发带来的三值里，凡是有效、且与现有记录不同的位，按位并入记录。
+     *  场景：一只耳机戴着，另一只在盒里充电，开盖连上时盒和盒中耳机的新电量
+     *  会随卡重发被看见——不并入的话，关盖后补值又变回开盖前的旧值。
+     *  只在耳机自己上报、且值真的变了时才写（reportTriple 内部去重），不轮询。 */
+    private fun mergeValidSlots(mac: String, arr: IntArray) {
+        val base = parseTripleCsv(config.battery3For(mac)) ?: readCachedTriple(mac)
+        if (base == null) {
+            val a = slotVal(arr[0]); val b = slotVal(arr[1]); val c = slotVal(arr[2])
+            if (a != null && b != null && c != null) reportTriple(mac, "$a,$b,$c")
+            return
+        }
+        val baseArr = intArrayOf(base.first, base.second, base.third)
+        val out = IntArray(3)
+        var changed = false
+        for (i in 0..2) {
+            val v = slotVal(arr[i])
+            if (v != null && v != baseArr[i]) { out[i] = v; changed = true } else out[i] = baseArr[i]
+        }
+        if (changed) reportTriple(mac, out.joinToString(","))
     }
 
     /** 通知卡每次重发都经过 n.a(..., iArr, ...)：内存里留一份刚显示的三值，
@@ -1328,12 +1360,25 @@ class MiConnectModule : XposedModule() {
                                 if (dev != null && norm != null && incoming != null && incoming.size == 3 &&
                                     config.whitelist.contains(norm)) {
                                     val prev = lastSeenTriple[norm]
+                                    lg("card post $norm in=${incoming.joinToString(",")} prev=${prev?.joinToString(",")}")
+                                    val nowMs = SystemClock.elapsedRealtime()
+                                    var returned = prev == null &&
+                                        slotVal(incoming[0]) != null && slotVal(incoming[1]) != null && slotVal(incoming[2]) != null
+                                    var dropped = false
                                     if (prev != null) {
-                                        var dropped = false
                                         for (i in 0..2) {
+                                            if (slotVal(prev[i]) == null && slotVal(incoming[i]) != null) returned = true
                                             if (slotVal(prev[i]) != null && slotVal(incoming[i]) == null) dropped = true
                                         }
-                                        if (dropped) snapshotTriple(norm, incoming, prev)
+                                    }
+                                    if (returned) openSessionUntil[norm] = nowMs + 30_000
+                                    if (dropped) {
+                                        // 关盖定格：把开盖期间最后看到的三值存下来
+                                        snapshotTriple(norm, incoming, prev)
+                                        openSessionUntil.remove(norm)
+                                    } else if ((openSessionUntil[norm] ?: 0L) > nowMs) {
+                                        // 只在开盖窗口内更新记录，平时佩戴不抓
+                                        mergeValidSlots(norm, incoming)
                                     }
                                     lastSeenTriple[norm] = incoming.copyOf()
                                 }
@@ -1368,7 +1413,10 @@ class MiConnectModule : XposedModule() {
         if (!config.batterySync) return
         val norm = MacUtil.normalize(mac) ?: return
         val nums = tripleCsv.split(',').mapNotNull { it.trim().toIntOrNull()?.and(0x7F) }
-        if (nums.size != 3 || nums.any { it !in 0..100 }) return
+        if (nums.size != 3 || nums.any { it !in 0..100 }) {
+            lg("battery3 reject $norm raw=$tripleCsv")
+            return
+        }
         val csv = nums.joinToString(",")
         synchronized(lastTripleSent) {
             if (lastTripleSent[norm] == csv) return
@@ -1460,7 +1508,9 @@ class MiConnectModule : XposedModule() {
                                     val mac = MacUtil.normalize(tag.removePrefix("BTHeadset"))
                                     if (mac != null && config.whitelist.contains(mac)) {
                                         // 模块抓的三值（断开瞬间存的）比缓存新，优先用它
-                                        val t = parseTripleCsv(config.battery3For(mac)) ?: readCachedTriple(mac)
+                                        val t3 = parseTripleCsv(config.battery3For(mac))
+                                        val t = t3 ?: readCachedTriple(mac)
+                                        if (t != null) lg("card fill src=${if (t3 != null) "battery3" else "cache"} $mac t=${t.first},${t.second},${t.third}")
                                         if (t != null) {
                                             val extras = notif.extras
                                             val cur = extras?.getCharSequence(Notification.EXTRA_TEXT)?.toString()
