@@ -893,6 +893,7 @@ class MiConnectModule : XposedModule() {
                 hookSaveLastBattery(cl)
                 hookNotificationCancel(cl)
                 hookHeadsetCardText(cl)
+                hookCardPoster(cl)
             }
             if (param.packageName !in TARGETS) {
                 // 不在过滤目标内的进程：只留配置通道，过滤层不进
@@ -1264,8 +1265,81 @@ class MiConnectModule : XposedModule() {
                                 val norm = MacUtil.normalize(mac)
                                 if (norm != null && config.whitelist.contains(norm)) {
                                     lg("battery cache clear vetoed for $norm")
+                                    // 整机断开瞬间：把卡上最后显示的三值存下来（比缓存新）
+                                    snapshotTriple(norm, null, readCardStash(cl, dev))
                                     reportDisconnect(norm)
                                     return null
+                                }
+                            }
+                        } catch (_: Throwable) {}
+                        return chain.proceed(chain.args.toTypedArray())
+                    }
+                }
+            })
+    }
+
+    // ------------------------------------------------------------ 断开瞬间抓三值
+    //
+    // 连接期间的实时电量（MMA 上报）只喂通知卡、不写 DeviceIdCached 缓存，
+    // 所以缓存里的三值会停在连接初期，戴着耗掉的电跟不上。通知卡类自己存了
+    // 一份「最后一次显示的三值」（静态方法 g 取），那是实时上报喂的、最新。
+    // 这里只在断开事件读它一次：某只耳机刚回盒（卡重发时该位由有效变失效）
+    // 或整机断开（缓存清除被拦下时）。不持续抓、不轮询。
+
+    private fun readCardStash(cl: ClassLoader, dev: BluetoothDevice?): IntArray? {
+        if (dev == null) return null
+        return try {
+            val cls = Class.forName("com.android.bluetooth.ble.app.headset.n", false, cl)
+            val m = cls.getMethod("g", BluetoothDevice::class.java)
+            (m.invoke(null, dev) as? IntArray)?.takeIf { it.size == 3 }
+        } catch (_: Throwable) { null }
+    }
+
+    private fun slotVal(v: Int): Int? {
+        val m = v and 0x7F
+        return if (v != 255 && m in 0..100) m else null
+    }
+
+    /** 断开瞬间并三值：fresh 有效的位用 fresh，其次用断开前最后显示的 stash，
+     *  都没有的位保留已有记录；有一位无从得知就不写半截三值。 */
+    private fun snapshotTriple(mac: String, fresh: IntArray?, stash: IntArray?) {
+        if (!config.batterySync) return
+        val base = parseTripleCsv(config.battery3For(mac)) ?: readCachedTriple(mac)
+        val baseArr = base?.let { intArrayOf(it.first, it.second, it.third) }
+        val out = IntArray(3)
+        for (i in 0..2) {
+            val v = (if (fresh != null) slotVal(fresh[i]) else null)
+                ?: (if (stash != null) slotVal(stash[i]) else null)
+                ?: baseArr?.get(i)
+            if (v == null) return
+            out[i] = v
+        }
+        reportTriple(mac, out.joinToString(","))
+    }
+
+    /** 通知卡每次重发都经过 n.a(..., iArr, ...)：平时不抓，只在一只耳机的值
+     *  由有效变失效（刚回盒）这一刻，把断开前显示的三值存下来。 */
+    private fun hookCardPoster(cl: ClassLoader) {
+        hookAll(cl, "com.android.bluetooth.ble.app.headset.n",
+            { m -> m.name == "a" && m.parameterTypes.size == 5 },
+            {
+                object : XposedInterface.Hooker {
+                    override fun intercept(chain: XposedInterface.Chain): Any? {
+                        try {
+                            if (config.batterySync) {
+                                val dev = chain.args.getOrNull(1) as? BluetoothDevice
+                                val norm = MacUtil.normalize(try { dev?.address } catch (_: Throwable) { null })
+                                val incoming = chain.args.getOrNull(2) as? IntArray
+                                if (dev != null && norm != null && incoming != null && incoming.size == 3 &&
+                                    config.whitelist.contains(norm)) {
+                                    val stash = readCardStash(cl, dev)
+                                    if (stash != null) {
+                                        var dropped = false
+                                        for (i in 0..2) {
+                                            if (slotVal(stash[i]) != null && slotVal(incoming[i]) == null) dropped = true
+                                        }
+                                        if (dropped) snapshotTriple(norm, incoming, stash)
+                                    }
                                 }
                             }
                         } catch (_: Throwable) {}
@@ -1389,7 +1463,8 @@ class MiConnectModule : XposedModule() {
                                 if (tag != null && notif != null && tag.startsWith("BTHeadset")) {
                                     val mac = MacUtil.normalize(tag.removePrefix("BTHeadset"))
                                     if (mac != null && config.whitelist.contains(mac)) {
-                                        val t = readCachedTriple(mac) ?: parseTripleCsv(config.battery3For(mac))
+                                        // 模块抓的三值（断开瞬间存的）比缓存新，优先用它
+                                        val t = parseTripleCsv(config.battery3For(mac)) ?: readCachedTriple(mac)
                                         if (t != null) {
                                             val extras = notif.extras
                                             val cur = extras?.getCharSequence(Notification.EXTRA_TEXT)?.toString()
