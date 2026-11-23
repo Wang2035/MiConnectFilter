@@ -1418,18 +1418,25 @@ class MiConnectModule : XposedModule() {
             return
         }
         val csv = nums.joinToString(",")
-        synchronized(lastTripleSent) {
-            if (lastTripleSent[norm] == csv) return
-            lastTripleSent[norm] = csv
-        }
-        try {
-            val key = MacUtil.keyOf(norm)
-            if (key != null && config.battery3[key] != csv) {
+        // 先把本地配置同步到最新值，再谈广播去重：配置广播会把本进程的
+        // battery3 整表覆盖成设置页渲染时的旧记录，只靠去重判断会让本地
+        // 永远卡在旧值上（2026-11-23 日志实证：快照算出 (60,65,90)，
+        // reportTriple 却因 lastTripleSent 已有此值直接返回，补值用了 (95,95,90)）。
+        val key = MacUtil.keyOf(norm)
+        val localHas = try { key != null && config.battery3[key] == csv } catch (_: Throwable) { false }
+        if (key != null && !localHas) {
+            try {
                 val next = LinkedHashMap(config.battery3)
                 next[key] = csv
                 config = config.copy(battery3 = next)
-            }
-        } catch (_: Throwable) {}
+            } catch (_: Throwable) {}
+        }
+        synchronized(lastTripleSent) {
+            // 跳过广播的条件：这份值发过、且本地配置也确实是它。
+            // 本地刚被覆盖回旧值时必须重发，让设置页那边也愈合。
+            if (lastTripleSent[norm] == csv && localHas) return
+            lastTripleSent[norm] = csv
+        }
         try {
             val app = appContext ?: return
             val intent = Intent(ConfigBus.BATTERY_ACTION).apply {
